@@ -1,0 +1,14 @@
+# Local runtime configuration for toward-nadal.
+# Copy this file to `config.toml` and replace the placeholder paths with
+# absolute paths on your machine.
+
+[memory]
+# Current scope only supports an Obsidian vault directory.
+obsidian_vault_dir = "/absolute/path/to/your/obsidian/vault"
+
+[video]
+# Directory containing the original long-form videos to ingest.
+raw_dir = "/absolute/path/to/raw/videos"
+
+# Working directory for generated rally clips and other derived video assets.
+clips_dir = "/absolute/path/to/working/clips"
