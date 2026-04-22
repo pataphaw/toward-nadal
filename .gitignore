@@ -1,2 +1,4 @@
 config.toml
 .work/
+.DS_Store
+tools/__pycache__/
