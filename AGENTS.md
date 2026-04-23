@@ -8,9 +8,8 @@
 - `Void`：定义规则、边界与目录语义
 - `.void/idea/`：记录动机、目标、问题与约束
 - `.void/blueprint/`：记录系统边界与高层结构
-- `.void/solution/`：记录方案、决策与取舍
-- `.void/implementation/`：记录里程碑、任务、阻塞与下一步
-- `.void/validation/`：记录验证过程、证据、结果与结论
+- `.void/solution/`：记录方案、决策、取舍与版本演进（按子命题拆分）
+- `.void/validation/`：记录验证过程、证据、结果与结论（建议格式，非强制）
 - `.void/release/`：记录阶段成果、可用范围与已知限制
 
 ## 协作规则

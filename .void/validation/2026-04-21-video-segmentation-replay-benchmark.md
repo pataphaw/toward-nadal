@@ -1,8 +1,8 @@
 # 视频切片重跑验证记录
 
 ## 验证对象
-- 子域方案：[视频切片架构（Solution）](../solution/04-video-segmentation.md)
-- 实现版本：[视频切片 V1 实现文档](../implementation/04-video-segmentation-v1.md)
+- 子域方案：[视频切片架构（Current）](../solution/04-video-segmentation/current.md)
+- 方案版本：`video-segmentation/current`（当前生效版本 `V1`）
 - 验证范围：`V1` 的切片导出重跑能力，不包含新的边界推导
 
 ## 目的

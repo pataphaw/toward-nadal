@@ -1,8 +1,8 @@
 # 视频切片运动优先修复记录
 
 ## 验证对象
-- 子域方案：[视频切片架构（Solution）](../solution/04-video-segmentation.md)
-- 实现版本：[视频切片 V1 实现文档](../implementation/04-video-segmentation-v1.md)
+- 子域方案：[视频切片架构（Current）](../solution/04-video-segmentation/current.md)
+- 方案版本：`video-segmentation/current`（当前生效版本 `V1`）
 - 验证范围：`V1` 中“运动优先于音频”规则调整后的边界修复效果
 
 ## 背景
