@@ -96,7 +96,7 @@
 - 会话置信度
 
 对应子方案：
-- [运动识别架构](../solution/01-sport-detection.md)
+- [运动识别架构](../solution/01-sport-detection/current.md)
 
 ### 第二层：素材归属与接入层
 负责回答两个问题：
@@ -108,8 +108,8 @@
 - 已同步并导出到本地工作目录的原始视频
 
 对应子方案：
-- [视频识别架构](../solution/02-video-identification.md)
-- [视频同步架构](../solution/03-video-sync.md)
+- [视频识别架构](../solution/02-video-identification/current.md)
+- [视频同步架构](../solution/03-video-sync/current.md)
 
 ### 第三层：片段结构化层
 负责把原始长视频转换为可枚举、可筛选、可引用的片段集合。
@@ -121,7 +121,7 @@
 - 片段级基础元数据
 
 对应子方案：
-- [视频切片架构](../solution/04-video-segmentation.md)
+- [视频切片架构](../solution/04-video-segmentation/current.md)
 
 ### 第四层：代表性选择层
 负责从大量片段中选出最值得重点分析的少量样本。
@@ -131,7 +131,7 @@
 - 避免人工随机选段造成的偏差
 
 对应子方案：
-- [视频精选架构](../solution/05-video-selection.md)
+- [视频精选架构](../solution/05-video-selection/current.md)
 
 ### 第五层：分析与知识沉淀层
 负责把代表片段转成可复盘、可继承的知识产物。
@@ -142,8 +142,8 @@
 - 沉淀：将结果写入 `Obsidian`，形成稳定事实源
 
 对应子方案：
-- [视频分析架构](../solution/06-video-analysis.md)
-- [结果保存架构](../solution/07-result-persistence.md)
+- [视频分析架构](../solution/06-video-analysis/current.md)
+- [结果保存架构](../solution/07-result-persistence/current.md)
 
 ## 主数据流
 1. `Apple Watch / iPhone` 输出候选训练窗口和相关信号。
