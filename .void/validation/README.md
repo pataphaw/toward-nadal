@@ -41,6 +41,12 @@
 视频精选当前还有 `1` 份跨视频通用性检查：
 - `img_3026` 通用性检查：[2026-04-26-video-selection-img3026-generalization-check](./2026-04-26-video-selection-img3026-generalization-check.md)
 
+## 与 Void v0.2.2 的迁移约定
+- 现有验证文档保持原文件名与原链接，不做追溯性批量重命名。
+- 从下一轮正式修改某个 `solution/current.md` 开始，先归档当前版本，再补对应版本的 `validation`。
+- 新增 validation 应显式写出对应的 solution 版本、用户反馈、agent 分析与对问题原因的判断。
+- 当验证明确对应某个正式 solution 版本时，优先使用版本号命名；历史探索性记录继续保留描述性命名即可。
+
 ## 建议阅读顺序
 如果要理解方案如何收敛，建议按时间顺序阅读：
 
