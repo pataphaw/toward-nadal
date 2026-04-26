@@ -3,23 +3,49 @@
 ## 文档定位
 `.void/validation/` 用来沉淀“已经做过的验证、看到的证据、形成的结论”，而不是继续描述方案本身。
 
-当前目录中的记录全部围绕视频切片 `V1` 展开，因此应按“同一子域的一组验证证据”来阅读，而不是把每份文档视为彼此孤立的临时记录。
+当前目录中的记录目前覆盖两个子域：
+- 视频切片 `04-video-segmentation`
+- 视频精选 `05-video-selection`
+
+每份验证都应按“某个子域的一条证据链”来阅读，而不是把单份文档视为彼此孤立的临时记录。
 
 相关方案入口：
 - 当前方案：[视频切片架构（Current）](../solution/04-video-segmentation/current.md)
 - 历史方案：[视频切片方案历史（V1）](../solution/04-video-segmentation/history/v1.md)
 - 子域索引：[视频切片 V1 验证索引](./video-segmentation-v1-validation-index.md)
+- 当前方案：[视频精选架构（Current）](../solution/05-video-selection/current.md)
+- 历史方案：[视频精选方案历史（V1）](../solution/05-video-selection/history/v1.md)
+- 历史方案：[视频精选方案历史（V4）](../solution/05-video-selection/history/v4.md)
 
 ## 当前目录结构
-当前目录暂时只有一个验证子域：
+当前目录目前有两个验证子域：
 - `video-segmentation-v1`
+- `video-selection`
 
-对应记录共 `5` 份，覆盖五类验证：
+视频切片当前有 `5` 份验证，覆盖五类证据：
 - 首轮落地基线：[2026-04-20-video-segmentation-v1-bootstrap](./2026-04-20-video-segmentation-v1-bootstrap.md)
 - 导出重跑与资源基线：[2026-04-21-video-segmentation-replay-benchmark](./2026-04-21-video-segmentation-replay-benchmark.md)
 - 边界重推基线：[2026-04-22-video-segmentation-boundary-rederive](./2026-04-22-video-segmentation-boundary-rederive.md)
 - 误拆修复验证：[2026-04-22-video-segmentation-motion-priority-fix](./2026-04-22-video-segmentation-motion-priority-fix.md)
 - 真实使用抽样复核：[2026-04-24-img3076-segmentation-sampling](./2026-04-24-img3076-segmentation-sampling.md)
+
+视频精选当前有 `4` 份验证，形成一条连续反馈链：
+- 回合完整性反馈与修正：[2026-04-25-video-selection-img3076-rally-completeness](./2026-04-25-video-selection-img3076-rally-completeness.md)
+
+视频精选当前还有 `1` 份后续边界反馈：
+- 回合起点边界反馈与修正：[2026-04-26-video-selection-img3076-rally-start-boundary](./2026-04-26-video-selection-img3076-rally-start-boundary.md)
+
+视频精选当前还有 `1` 份后续修复验证：
+- 回合起点修复验证：[2026-04-26-video-selection-img3076-rally-start-repair](./2026-04-26-video-selection-img3076-rally-start-repair.md)
+
+视频精选当前还有 `1` 份跨视频通用性检查：
+- `img_3026` 通用性检查：[2026-04-26-video-selection-img3026-generalization-check](./2026-04-26-video-selection-img3026-generalization-check.md)
+
+## 与 Void v0.2.2 的迁移约定
+- 现有验证文档保持原文件名与原链接，不做追溯性批量重命名。
+- 从下一轮正式修改某个 `solution/current.md` 开始，先归档当前版本，再补对应版本的 `validation`。
+- 新增 validation 应显式写出对应的 solution 版本、用户反馈、agent 分析与对问题原因的判断。
+- 当验证明确对应某个正式 solution 版本时，优先使用版本号命名；历史探索性记录继续保留描述性命名即可。
 
 ## 建议阅读顺序
 如果要理解方案如何收敛，建议按时间顺序阅读：
