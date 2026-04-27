@@ -1,621 +1,664 @@
 # 视频精选架构（Current）
 
 ## 文档定位
-本文档定义视频精选子域当前生效的首版方案。
+本文档定义视频精选子域当前生效方案。
+
+当前版本已经从架构草案补齐为实现规格。它必须能直接指导代码实现，不再把关键工程决策留给实现者临场判断。
 
 它回答的是：
-- 05 selection 真正要为谁服务。
-- 在当前这台 `Mac` 上，首版怎样务实落地。
-- 04 segmentation 的 `point clip` 如何被重新组织成更适合 06 analysis 的分析样本。
-- 哪些能力当前要做，哪些能力明确暂缓。
+- 05 selection 在 `CV` 与本地视觉模型之间如何分工。
+- v1 第一版具体使用哪个本地视觉模型运行时。
+- `selection_package`、候选、模型输入、模型判断和最终选择的字段契约是什么。
+- 如何让 05 输出继续被 06 analysis 与 07 persistence 稳定消费。
 
 相关文档：
 - [视频切片架构（Current）](../04-video-segmentation/current.md)
+- [视频分析架构（Current）](../06-video-analysis/current.md)
+- [结果保存架构（Current）](../07-result-persistence/current.md)
+- [配置方案](../configuration.md)
+- [总体架构](../../blueprint/overall-architecture.md)
+- [视频精选 v1.0.1 实现规格补强验证](../../validation/2026-04-28-video-selection-v1.0.1-implementation-spec.md)
+
+历史方案链路：
 - [视频精选方案历史（V1）](./history/v1.md)
 - [视频精选方案历史（V2）](./history/v2.md)
 - [视频精选方案历史（V3）](./history/v3.md)
 - [视频精选方案历史（V4）](./history/v4.md)
-- [视频分析架构（Current）](../06-video-analysis/current.md)
-- [总体架构](../../blueprint/overall-architecture.md)
-- [回合起点边界修复验证](../../validation/2026-04-26-video-selection-img3076-rally-start-repair.md)
-- [跨视频通用性检查](../../validation/2026-04-26-video-selection-img3026-generalization-check.md)
+- [视频精选方案历史（v0.4.0）](./history/v0.4.0.md)
+- [视频精选方案历史（v1.0.0）](./history/v1.0.0.md)
+
+说明：
+- 当前方案是一次大规模重设计，用于代码实现时不以历史方案作为实现依据。
+- 历史方案仅用于追溯 selection 子域的演进、失败模式和版本替代关系。
 
 ## 当前生效版本
-当前生效版本为 `V4-rally-interval-export`。
+当前生效版本为 `v1.0.1-implementation-ready-local-vlm-rerank`。
 
-它不是“自动挑最好看的视频”，而是“自动组织一组最值得分析的代表样本”。
+这是 `05 selection` 的当前主线：
+- `CV` 不再承担最终语义判断。
+- `CV` 只负责高召回候选生成、基础质量判断、运动证据提取和候选窗口定位。
+- 本地视觉模型负责判断候选是否真正在打球、是否完整、是否值得分析。
+- selection 负责过滤、覆盖约束、去重、排序和不确定性暴露。
 
-当前版本的现实目标是：
-- 基于 04 输出的 `point clip`，在本地先筛出可分析素材。
-- 用轻量规则和可解释信号，尽量补足 `正手 / 反手 / 发球`、场景多样性和精彩回合。
-- 当自动判定置信度不足时，把不确定性显式暴露出来，而不是伪装成已经理解了动作语义。
-- 保持“精彩击球定位”和“完整回合导出”这两层时间语义同时存在。
-- 当导出边界仍然无法回到回合开头时，优先放弃该候选，而不是硬保留一个大粘片。
-- 对最终导出边界，优先恢复低阈值 `rally interval`，而不是仅围绕高光窗口向外扩。
+## 核心结论
+selection 的目标不是“找运动最强的片段”，而是“选出最值得送给 06 analysis 的代表样本”。
 
-## 用户真实诉求
-本子域服务的真实目标不是“做视频摘要”，而是为后续技术分析准备一小组高价值样本。
+这个目标已经超出纯 `CV + 规则` 的稳定能力边界。
 
-最终希望送给大模型的，不是随机回合，也不是单纯最长片段，而是：
-- 能覆盖本次训练中关键动作面的片段。
-- 能同时看到做对了什么、做错了什么的片段。
-- 能反映不同击球情境，而不是全是同一种底线相持。
-- 能包含值得重点复盘的精彩回合。
-
-这决定了精选层的核心对象不是“整段 `point clip` 本身”，而是：
-- `analysis candidate`：一个可送去分析的样本单元。
-
-`analysis candidate` 可以有两种形态：
-- 直接等于一个 `point clip`。
-- 引用一个 `point clip`，并同时保留：
-  - `focus_window`
-  - `selected_clip_window`
-
-这样设计的原因是：
-- 04 当前允许“略粘”，部分 `point clip` 会包含多个回合或较长空档。
-- 05 的职责不是重写切片器，但可以在不修改 04 边界的前提下，为分析层定位更值得看的内部时间窗，并把精彩击球放回所属完整回合中。
+因此新版方案采用两层职责：
+- `CV candidate generation`：便宜、稳定、可解释、高召回，宁可多给候选，不在这里做最终淘汰。
+- `local VLM rerank`：较贵、语义更强，负责候选级最终判断，只处理已经被压缩过的小候选池。
 
 ## 目标与边界
 本子域负责：
-- 从 04 的候选片段中挑出少量高价值样本。
-- 为每个样本补充“为什么选它”的结构化理由。
-- 明确本次分析样本的覆盖情况、缺口和低置信度项。
+- 从 04 的 `point_clips` 中生成一组高召回候选。
+- 为每个候选提取可解释的 CV 证据。
+- 为每个候选构建模型输入包。
+- 调用本地视觉模型输出结构化 `model_judgement`。
+- 基于模型判断、覆盖约束和候选质量输出 `selected_clips`。
+- 把不确定项显式放入 `review_queue`。
 
 本子域不负责：
-- 回合边界重算。
-- 完整技术诊断。
-- 依赖云端或重训练模型的精细动作识别。
-- 代替 06 输出最终的技术结论。
+- 训练或微调视觉模型。
+- 生成最终网球技术诊断。
+- 逐帧精确识别每一次击球类型、球路、落点或旋转。
+- 依赖云端模型作为主路径。
+- 用 CV 规则替代视觉模型做最终语义裁判。
 
-## 硬约束
-以下约束高于局部评分，是当前方案层的硬边界。
+## 能力边界
+### CV 应该做什么
+`CV` 适合承担确定性强、成本低、可解释的前处理任务：
+- 视频可用性检查：黑屏、模糊、抖动、分辨率、帧率。
+- 候选窗口定位：运动峰值、连续运动区间、音频瞬态、空档。
+- 片段压缩：从长 `point clip` 中提取若干短候选窗口。
+- 基础证据提取：运动密度、横向位移、dead time、候选时长、边界风险。
+- 候选去重：时间重叠、同源片段、运动轮廓近似重复。
 
-### 1. 精选目标是“可分析价值”，不是“视频观感最好”
-不能因为片段里打得差、失误多或动作变形，就把它过滤掉。
+`CV` 不应负责最终判断：
+- 是否真的是打球回合。
+- 是否是休息、捡球、回位、等待。
+- 是否完整覆盖一个 rally。
+- 是否是正手、反手、发球的可靠覆盖样本。
+- 是否是值得复盘的亮点或问题样本。
 
-### 2. 最终集合必须满足动作覆盖
-最终入选集合加总后必须覆盖：
-- `forehand`
-- `backhand`
-- `serve`，前提是本次原始视频里确实存在发球
+### 本地视觉模型应该做什么
+本地视觉模型负责候选级语义理解：
+- 判断候选是否 `in_play`。
+- 判断是否存在明显的休息 / 捡球 / 等待 / 走动。
+- 判断候选是否覆盖较完整 rally。
+- 粗判是否包含 `forehand`、`backhand`、`serve`。
+- 判断候选的复盘价值：`highlight`、`good_example`、`problem_example`。
+- 给出简短、可追溯的入选或排除理由。
 
-如果自动流程无法高置信度确认这些覆盖项，系统不能静默跳过，必须显式输出：
-- `coverage_gap`
-- `needs_review`
+本地视觉模型不负责：
+- 长视频全量扫描。
+- 毫秒级边界切割。
+- 专业级动作归因。
+- 输出最终训练建议。
 
-如果由于候选规模不足或质量不可用，客观上无法同时满足全部硬约束，也不能伪装为“已满足”。
-必须显式输出：
-- `selection_status = constrained_incomplete`
-- `infeasible_reasons`
-- `review_queue`
+## v1.0.1 固定实现决策
+### 本地模型运行时
+v1.0.1 第一版固定使用：
+- `provider = ollama`
+- `endpoint = http://localhost:11434/api/chat`
+- `model = qwen2.5vl:7b`
+- `fallback_model = qwen2.5vl:3b`
+- `temperature = 0`
+- `format = JSON Schema`
+- `timeout_seconds = 120`
+- `max_retries = 1`
 
-### 3. 最终集合应尽量覆盖不同情境
-至少应优先争取覆盖：
-- `baseline`
-- `midcourt`
-- `stationary`
-- `running`
-- `left`
-- `center`
-- `right`
-- `good-example`
-- `problem-example`
+选择理由：
+- `Ollama` 官方支持 vision model 的图像输入。
+- `Ollama` 官方支持 structured outputs。
+- `qwen2.5vl` 在 Ollama library 中提供 `3b / 7b / 32b / 72b` 版本，并支持 `Text, Image` 输入。
+- 关键帧序列输入比直接视频输入更稳定，也更符合 Ollama vision API 的工程形态。
 
-这些是软约束，不要求每次都齐全，但必须被显式度量。
+明确暂缓：
+- `MLX/VLM` 不作为 v1.0.1 必需实现路径，只保留为后续 `local_vlm_runner` adapter。
+- 不在 v1.0.1 中实现云端模型 fallback。
 
-### 4. 精彩回合必须进入竞争序列
-长回合、高击球密度、连续高质量击球的片段，不能在质量过滤时被误杀。
+### 模型输入形态
+v1.0.1 不把视频文件直接传给模型。
 
-### 5. 对长片段要惩罚“无效内容比率”，但不因为时长本身而否决
-片段长不是问题。
-问题是：
-- 一个片段里混了多个独立回合。
-- 回合之间有较长无效内容。
+每个候选传入：
+- `6-12` 张 JPEG 关键帧，默认 `9` 张。
+- 候选元数据。
+- CV 证据摘要。
+- 固定 prompt。
+- JSON Schema。
 
-因此当前不采用“超过多少秒就降级”的简单规则，而采用：
-- `有效击球窗口占比`
-- `回合连续性`
-- `空档比率`
-- `候选 focus window 密度`
+关键帧必须覆盖：
+- 候选开头。
+- 候选中段。
+- 候选结尾。
+- CV 运动峰值附近补帧。
 
-## 执行约束
-当前首版必须符合已知环境现实：
-- `macOS Apple Silicon`
-- 本地可用 `python3`、`ffmpeg`、`ffprobe`
-- 本机可通过 `ollama` 运行小模型
-- 可以接受轻量 CPU 推理
-- 不能把 `CUDA`、云端服务、训练流程作为主路径前提
+### 模型调用方式
+实现层应直接调用 Ollama HTTP API，避免新增 Python SDK 依赖。
 
-因此首版推荐的实现形态是：
-- `ffmpeg/ffprobe`：探测、抽帧、抽音频特征
-- `Python + OpenCV + NumPy`：规则特征和局部跟踪
-- `MediaPipe Pose` 或等价 CPU 级姿态能力：只作为轻量增强，不作为重模型前提
-- `ollama + 本地小模型`：只作为可选语义复核层，不作为首版唯一依赖
+请求必须满足：
+- `stream = false`
+- `options.temperature = 0`
+- `format = model_judgement_schema`
+- `messages[0].images` 使用 base64 JPEG 列表
+- prompt 中同时嵌入简短 schema 说明，避免模型忽略结构约束
 
-如果姿态能力不可用，系统仍应可运行，只是必须进入更保守的降级路径。
-如果本地小模型不可用，系统同样仍应可运行，只是失去一层低置信度样本的语义复核能力。
+如果请求超时、连接失败、模型不存在或返回非 2xx：
+- 若当前模型不是 fallback，则尝试 `fallback_model`。
+- 若 fallback 仍失败，则本轮输出 `selection_status = model_unavailable`。
 
-## 选择对象与输入输出契约
+## 输入输出契约
 ### 输入
-05 selection 的标准输入来自 04 的一次切片运行：
+标准输入来自 04 的一次切片运行：
 - `manifest.json`
 - `point_clips/`
 
-每个候选 `point clip` 至少继承以下字段：
-- `clip_id`
-- `source_video_id`
-- `start_time`
-- `end_time`
-- `duration`
-- `confidence`
-- `boundary_evidence`
-- `export_path`
+每个 `point_clip` 至少继承：
+- `clip_id: string`
+- `source_video_id: string`
+- `start_time: number`
+- `end_time: number`
+- `duration: number`
+- `confidence: number`
+- `boundary_evidence: object`
+- `export_path: string`
 
-可选补充输入：
-- 用户稳定画像，例如 `handedness`
-- 对 `serve` 是否存在的外部先验，例如 `serve_presence = auto/present/absent`
-- 本次任务约束，例如“本轮更关注反手”
-
-`handedness` 不应写死在 05 内部。
-如果外部已知，应作为显式输入传入；如果未知，05 只能做低置信度推断，不能伪装成确定事实。
+可选输入：
+- `handedness = right / left / unknown`
+- `serve_presence = auto / present / absent`
+- `selection_focus: string[]`
+- `candidate_pool_size: number`，默认 `18`
+- `selected_size: number`，默认 `6`
+- `frames_per_candidate: number`，默认 `9`
 
 ### 输出
-05 输出的不是单纯片段列表，而是一份可直接被 06 消费的 `selection package`。
+05 输出 `selection_package`。
 
-推荐顶层字段：
-- `selection_version`
-- `source_segmentation_run`
-- `candidate_pool`
-- `selected_clips`
-- `coverage_report`
-- `review_queue`
-- `selection_status`
-- `infeasible_reasons`
-- `selection_notes`
+顶层字段：
+- `selection_version: "v1.0.1-implementation-ready-local-vlm-rerank"`
+- `source_segmentation_run: object`
+- `selection_run_id: string`
+- `params: object`
+- `cv_candidate_pool: cv_candidate[]`
+- `model_input_packages: model_input_package[]`
+- `model_judgements: model_judgement[]`
+- `selected_clips: selected_clip[]`
+- `coverage_report: coverage_report`
+- `review_queue: selected_clip[]`
+- `selection_status: selection_status`
+- `infeasible_reasons: string[]`
+- `selected_clip_exports_dir: string | null`
+- `selected_clip_exports: object[]`
+- `selection_notes: object`
 
-其中 `selected_clips[]` 至少包含：
-- `selection_id`
-- `clip_id`
-- `source_video_id`
-- `source_clip_path`
-- `clip_start_time`
-- `clip_end_time`
+`selection_status` 枚举：
+- `ready`
+- `constrained_incomplete`
+- `model_unavailable`
+- `model_degraded`
+- `no_candidates`
+
+`selected_clips[]` 必须同时保留新版字段和 06 兼容字段：
+- `candidate_window`
+- `export_window`
 - `focus_window`
-- `selected_clip_window`
-- `selection_reasons`
-- `coverage_roles`
-- `semantic_tags`
-- `quality_flags`
-- `selection_score`
-- `confidence`
-- `needs_review`
-
-`focus_window` 是首版的重要契约，格式建议为：
-- `source_clip_offset_start`
-- `source_clip_offset_end`
-- `absolute_start_time`
-- `absolute_end_time`
-- `absolute_timebase = source_video_timeline`
-
-`selected_clip_window` 是当前方案中的重要契约，用来表示最终导出视频应覆盖的完整 rally。
-
-设计约束是：
-- `focus_window` 用来表示“最值得分析的精彩击球局部”
-- `selected_clip_window` 用来表示“包含该精彩击球的完整回合窗口”
-
-当前版本进一步强化一条硬约束：
-- `selected_clip_window` 必须尽量从完整 rally 的开头开始
-- 如果起点或终点无法可靠定位，应把该候选视为高风险并降低优先级
-
-如果一个 `point clip` 足够纯净，二者可以重合。
-如果一个 `point clip` 内部混有多个回合或较长空档，则：
-- `focus_window` 应只指向最值得分析的一段
-- `selected_clip_window` 应覆盖该段所属的完整 rally
-
-## 关键判断
-### 1. 05 的基本单位应从 `point clip` 升级为 `analysis candidate`
-因为 04 当前允许“略粘”，05 不应被迫把整段长片直接送给 06。
-
-因此首版推荐两级对象：
-- `clip candidate`：来自 04 的原始 `point clip`
-- `analysis candidate`：在 `clip candidate` 内进一步定位的高价值分析窗口
-
-这能在不回写 04 的前提下，解决两个现实问题：
-- 长片段混入多个回合
-- 片段内部存在较长无效内容
-
-### 2. 语义覆盖依赖“粗识别 + 显式约束”，不依赖单一总分
-只按一个综合分排序，几乎一定会出现：
-- 全是底线相持
-- 全是看起来最稳定的动作
-- 没有问题样本
-- 发球或反手被遗漏
-
-因此首版采用：
-- `先标注`
-- `再做受约束选择`
-
-而不是：
-- `先总分排序`
-- `再看运气有没有覆盖`
-
-### 3. “动作类型识别”首版只做粗粒度、可解释的近似判断
-当前不承诺：
-- 精确识别每一次挥拍类型
-- 逐帧识别击球点
-- 自动理解复杂旋转和技战术意图
-
-当前只追求支撑精选所需的粗粒度标签：
-- 是否像发球片段
-- 是否包含明显正手
-- 是否包含明显反手
-- 更偏底线还是中场
-- 更偏原地还是跑动
-- 站位更偏左、中、右
-- 更像亮点样本还是问题样本
-
-## 信号来源
-首版只依赖当前 `Mac` 上可执行的本地信号。
-
-### 1. 04 segmentation 已有元数据
-直接复用：
-- `duration`
-- `confidence`
-- `boundary_evidence`
-- `child_point_clip_ids`
-- `aggregation_reason`
-
-这些信号可以帮助判断：
-- 边界是否可疑
-- 是否属于被合并过的长片段
-- 是否需要优先做内部 `focus window` 定位
-
-### 2. 本地质量与可用性信号
-通过 `ffprobe` 和抽帧得到：
-- 分辨率
-- 实际码率
-- 帧率
-- 亮度分布
-- 模糊度近似值
-- 是否存在大面积黑屏或严重抖动
-
-这层只判断“是否可分析”，不判断“打得好不好”。
-
-### 3. 本地时序信号
-通过低成本音视频处理得到：
-- 音频瞬态峰值
-- 画面运动峰值
-- 球员主体位移
-- 运动连续区间
-- 候选击球窗口密度
-
-这些信号用于：
-- 估计一个片段里是否存在多个独立回合
-- 找到更值得看的 `focus_window`
-- 估计回合是否足够丰富
-
-### 4. 轻量姿态与空间信号
-若本地可用 `MediaPipe Pose` 或等价 CPU 级姿态能力，则进一步提取：
-- 双肩、双髋、手腕、脚踝的大致位置
-- 击球前后的躯干朝向变化
-- 挥拍侧相对身体中心的位置
-- 击球前位移和击球后恢复的粗指标
-
-这一层只做“提升置信度”，不是首版唯一依赖。
-
-### 5. 本地小模型语义复核
-若本机可通过 `ollama` 运行小模型，则可增加一层低成本语义复核，但定位必须克制。
-
-推荐输入形态：
-- 单个 `focus_window` 的关键帧序列
-- 片段的低成本规则特征摘要
-- 可选的站位、运动强度、姿态粗特征
-
-推荐用途：
-- 对 `serve / forehand / backhand` 的低置信度候选做二次复核
-- 对 `highlight / good-example / problem-example` 做辅助排序
-- 生成更自然的 `selection_reasons` 草稿
-
-不推荐让本地小模型直接负责：
-- 决定硬约束是否已经满足
-- 替代规则层做主筛选
-- 输出最终技术诊断
-
-因此在当前方案中，`ollama` 的定位是：
-- `rule-only` 主路径之上的可插拔增强层
-- 只服务于 `candidate_pool` 或 `review_queue` 的补充判断
-
-## 首版执行流程
-### 1. 候选导入
-读取 04 的 `manifest.json` 和 `point_clips/`，形成按时间排序的 `clip candidate` 列表。
-
-### 2. 可分析性过滤
-先过滤明显不可用的片段，例如：
-- 文件损坏
-- 严重黑屏
-- 画面几乎不可辨认
-- 几乎没有任何有效运动或击球迹象
-
-这一步不能因为“打得差”而过滤。
-
-### 3. 内部高价值窗口定位
-对每个候选片段做局部扫描，找出 `1-3` 个 `focus_window` 候选。
-
-窗口定位优先依据：
-- 音频峰值序列
-- 运动峰值序列
-- 球员主体位移的连续性
-- 长片段中的空档断点
-
-当前实现上，`focus_window` 不只保留一种形态，而是优先生成三类候选：
-- `dense-cluster`：片段内部最连续、最适合直接分析的高密度窗口
-- `opening-probe`：贴近片头的开局窗口，用于补抓可能存在的发球或发球后第一拍结构
-- `wide-motion`：横向位移更明显的窗口，用于补抓跑动中击球和问题样本
-
-当前版本的重要调整是：
-- 当本地 `motion_active_intervals` 可用时，内部候选优先围绕它们生成
-- 不再默认继承粗粒度 `source_intervals` 作为导出窗口
-- 导出视频优先使用 `selected_clip_window`，而不是直接使用 `focus_window`
-- 当粗粒度 `source_intervals` 几乎覆盖整段长 clip 时，不再让它污染局部 quiet 检测
-- `selected_clip_window` 不再只靠“从高光向前后找 quiet gap”生成，而是先绑定到低阈值 `rally interval`
-- 只有在 `rally interval` 落定之后，才再做 quiet-boundary 修正
-- 对 `highlight / problem-example / filler` 候选，当前版本会额外通过一层 `in-play gate`
-- 明显更像“跨场走动 / 捡球 / 休息段高运动”的候选，会被标记为 `transit-motion-risk` 并尽量排除出最终精选
-- 当 `selected_clip_window` 退化成整段长 clip，或仍然无法回到 rally 起点时，应把它视为边界未定位成功的高风险候选
-
-输出结果应包括：
-- `effective_play_ratio`
-- `dead_time_ratio`
-- `focus_window_count`
-- `best_focus_window`
-
-如果一个长 `point clip` 内明显包含多个独立回合，05 不需要改写 04 边界，但应至少：
-- 只把最有价值的内部窗口送入本轮精选竞争
-- 给该片段打上 `multi-rally-risk`
-- 保证最终导出的视频窗口尽量覆盖单个完整 rally，而不是只覆盖高光局部
-- 如果无法做到上述目标，应优先淘汰该候选，而不是保留一个“看起来完整、实则整段很粘”的输出
-
-### 4. 粗粒度语义打标
-对每个候选窗口而不是整段片段，估计以下标签：
-
-#### 动作类型
-- `serve_prob`
-- `forehand_prob`
-- `backhand_prob`
-
-推荐判断逻辑：
-- `serve_prob`：优先看片段前部是否出现发球前静止准备、抛球样上举、首次击球接近片头、站位接近底线中央
-- `forehand / backhand`：结合 `handedness`、挥拍侧相对躯干中心的位置、击球前后身体转动方向做粗分类
-
-当前首版在没有姿态模型时，允许退化为更保守的 `OpenCV` 近似信号：
-- 片段前部的主体横向稳定度
-- 前段是否更接近底线中央
-- 前段静止后是否出现一次明显爆发
-- 主体重心更偏身体左侧还是右侧
-
-#### 场景类型
-- `baseline`
-- `midcourt`
-- `left / center / right`
-- `stationary / running`
-
-推荐判断逻辑：
-- 以球员脚部或身体中心在画面中的归一化位置近似站位
-- 以击球前若干帧位移幅度近似跑动程度
-
-当前实现里，`stationary / running` 不再只看总位移，而是同时结合：
-- 横向跨度
-- 首尾位移
-- 单位时间横向速度
-
-#### 价值类型
-- `highlight`
-- `good-example`
-- `problem-example`
-
-推荐判断逻辑：
-- `highlight`：长回合、高击球密度、较高节奏连续性、较少长空档
-- `good-example`：动作完整、节奏稳定、回合内部连续性好
-- `problem-example`：明显被动、失衡、仓促、回合很快在一次压力击球后终止
-
-这里必须明确：
-- `good-example` 和 `problem-example` 只是精选层的粗标签，不是最终技术结论
-
-### 5. 候选池构建
-先形成一个比最终结果更宽的 `candidate_pool`，建议 `10-16` 个样本。
-
-入池逻辑应同时考虑：
-- 质量可用
-- 具备明确覆盖价值
-- 具备明显精彩价值
-- 具备明显问题暴露价值
-- 与已入池候选不完全重复
-
-当前实现上，`candidate_pool` 不再是简单的总分截断，而是会显式保留一部分：
-- `opening-probe`
-- `wide-motion`
-- `stationary`
-- `serve-like` 候选
-
-### 6. 受约束选择
-从 `candidate_pool` 中选择最终送分析的 `selected_clips`，建议 `6-8` 个。
-
-若本次可用候选不足，实际选择数量应为：
-- `min(目标规模, 可用候选数)`
-
-选择顺序建议如下：
-1. 先锁定硬约束槽位：`forehand`、`backhand`、`serve-if-exists`
-2. 再补软约束：`baseline / midcourt`、`stationary / running`、`left / center / right`
-3. 再加入至少一个 `highlight`
-4. 再加入至少一个 `problem-example`
-5. 最后用相似度惩罚去掉过于重复的样本
-6. 去重后必须做一次硬约束回检；若回检失败，优先回填满足硬约束的次优候选
-
-相似度当前不必依赖大型视频嵌入，首版可用以下低成本特征近似：
-- 站位分布
-- 运动强度分布
-- 时长与击球密度
-- 片段时间邻近性
-- 同一长片内部是否来自相邻窗口
-
-### 7. 生成 review queue
-对于以下情况，必须进入 `review_queue`：
-- 自动流程无法确认 `forehand / backhand / serve` 覆盖
-- 某个覆盖项只有低置信度候选
-- 精彩样本和问题样本明显不足
-- 在候选规模充足时，候选主要来自少数两个片段，重复度过高
-
-`review_queue` 不是失败，而是首版的安全阀。
-它的目标是把人工确认范围压缩到极少数片段，而不是把整次精选退回全人工。
-
-如果本地 `ollama` 小模型可用，则可在进入人工确认前增加一步：
-- 先对 `review_queue` 做本地语义复核
-- 仅在复核后仍然低置信度时，再保留人工确认
-
-## 约束选择逻辑
-首版不采用单一总分，而采用“显式约束 + 局部评分”的混合选择。
-
-### 硬约束槽位
-- `must_have_forehand = 1`
-- `must_have_backhand = 1`
-- `must_have_serve = 1`，当前提满足以下任一条件：
-  - 全局 `serve_exists_prob` 超过阈值
-  - 全局 `serve_exists_prob` 不确定，但存在 `serve_prob` 较高的候选
-
-若全局 `serve_exists_prob` 明确不足以支持“存在发球”，则输出：
-- `serve_presence_likely_absent`
-
-若全局 `serve_exists_prob` 无法确认，则输出：
-- `serve_presence_uncertain`
-- `review_queue` 中至少保留 `1` 个最高 `serve_prob` 候选
-
-### 软覆盖目标
-- `prefer_baseline = 1`
-- `prefer_midcourt = 1`
-- `prefer_running = 1`
-- `prefer_stationary = 1`
-- `prefer_left_center_right = diversified`
-- `prefer_good_example = 1`
-- `prefer_problem_example = 1`
-- `prefer_highlight = 1`
-
-### 主要惩罚项
-- `dead_time_ratio` 高
-- `multi-rally-risk` 高
-- `semantic_confidence` 低
-- 与已选样本高度重复
-- 明显只是准备动作或捡球，没有足够击球信息
-
-### 关键原则
-一个长片段如果：
-- 覆盖价值很高
-- 但内部有较长空档
-
-它不应直接被淘汰，而应优先尝试缩到更小的 `focus_window` 后再参与竞争。
+
+兼容规则：
+- `focus_window` 是 `candidate_window` 的兼容别名。
+- 06 analysis 优先消费 `export_window` 对应导出视频。
+- 06 analysis 使用 `focus_window` 表示分析焦点。
+
+## 通用数据类型
+### `time_window`
+所有窗口字段统一使用以下结构：
+
+```json
+{
+  "source_clip_offset_start": 0.0,
+  "source_clip_offset_end": 12.4,
+  "absolute_start_time": 128.0,
+  "absolute_end_time": 140.4,
+  "absolute_timebase": "source_video_timeline"
+}
+```
+
+约束：
+- 单位为秒。
+- `source_clip_offset_start >= 0`。
+- `source_clip_offset_end > source_clip_offset_start`。
+- `absolute_start_time` 与 `absolute_end_time` 基于原始 source video 时间轴。
+
+### `confidence`
+所有置信度字段使用 `0.0-1.0`。
+
+分档：
+- `>= 0.70`：高置信。
+- `0.50-0.69`：中置信。
+- `< 0.50`：低置信。
+
+## 核心对象
+### `cv_candidate`
+`cv_candidate` 是 CV 层输出的候选样本。
+
+必填字段：
+- `candidate_id: string`
+- `clip_id: string`
+- `source_video_id: string`
+- `source_clip_path: string`
+- `candidate_kind: motion_dense / rally_wide / opening_probe / recovery_probe`
+- `candidate_window: time_window`
+- `export_window_proposal: time_window`
+- `cv_evidence: cv_evidence`
+- `cv_risk_flags: string[]`
+- `dedupe_key: string`
+- `source_clip_probe: object`
+
+语义约束：
+- 它只表示这段值得交给视觉模型判断。
+- 它不表示这段一定在打球。
+- 它不写入 `forehand / backhand / serve / highlight / problem_example` 等语义结论。
+
+### `cv_evidence`
+推荐字段：
+- `window_duration: number`
+- `effective_motion_ratio: number`
+- `dead_time_ratio: number`
+- `peak_motion_score: number`
+- `avg_motion_score: number`
+- `motion_span_x: number`
+- `motion_path_length: number`
+- `audio_interval_overlap: number`
+- `quality_flags: string[]`
+- `boundary_flags: string[]`
+
+### `model_input_package`
+每个候选必须落盘一份模型输入包。
+
+必填字段：
+- `candidate_id: string`
+- `input_dir: string`
+- `frames_dir: string`
+- `frame_paths: string[]`
+- `frame_count: number`
+- `candidate_video_path: string`
+- `prompt_path: string`
+- `input_json_path: string`
+- `schema_version: "model_judgement.v1"`
+
+落盘目录：
+- `selection_runs/<selection_run_id>/model_inputs/<candidate_id>/input.json`
+- `selection_runs/<selection_run_id>/model_inputs/<candidate_id>/prompt.txt`
+- `selection_runs/<selection_run_id>/model_inputs/<candidate_id>/frames/000.jpg`
+- `selection_runs/<selection_run_id>/model_inputs/<candidate_id>/frames/001.jpg`
+- `selection_runs/<selection_run_id>/model_inputs/<candidate_id>/candidate.mp4`
+- `selection_runs/<selection_run_id>/model_inputs/<candidate_id>/model_response.json`
+- `selection_runs/<selection_run_id>/model_inputs/<candidate_id>/judgement.json`
+
+缓存规则：
+- 如果 `judgement.json` 存在且 `input.json` 中的 `input_hash` 一致，可以复用模型结果。
+- 如果 prompt、schema、候选窗口或帧内容变化，必须重新调用模型。
+
+### `model_judgement`
+`model_judgement` 是本地视觉模型对单个候选的结构化判断。
+
+必填字段：
+- `schema_version: "model_judgement.v1"`
+- `candidate_id: string`
+- `in_play: yes / no / uncertain`
+- `non_play_type: none / picking_ball / resting / walking / waiting / camera_noise / uncertain`
+- `rally_completeness: complete / partial_start_missing / partial_end_missing / multi_rally / uncertain`
+- `action_tags: string[]`
+- `context_tags: string[]`
+- `value_tags: string[]`
+- `reject_reasons: string[]`
+- `selection_reason: string`
+- `confidence: number`
+
+字段约束：
+- `action_tags[]` 只能包含 `forehand`、`backhand`、`serve`。
+- `context_tags[]` 只能包含 `baseline`、`midcourt`、`running`、`stationary`。
+- `value_tags[]` 只能包含 `highlight`、`good_example`、`problem_example`。
+- `selection_reason` 不超过 `160` 个汉字或 `300` 个英文字符。
+- 若 `in_play = no`，`value_tags` 必须为空数组。
+- 若模型不确定，必须使用 `uncertain`，不能编造确定标签。
+
+### `selected_clip`
+必填字段：
+- `selection_id: string`
+- `candidate_id: string`
+- `clip_id: string`
+- `source_video_id: string`
+- `source_clip_path: string`
+- `candidate_window: time_window`
+- `focus_window: time_window`
+- `export_window: time_window`
+- `cv_evidence: cv_evidence`
+- `model_judgement: model_judgement`
+- `semantic_tags: object`
+- `coverage_roles: string[]`
+- `selection_reasons: string[]`
+- `selection_score: number`
+- `confidence: number`
+- `needs_review: boolean`
+
+`semantic_tags` 是 06 兼容字段，由 `model_judgement` 派生：
+- `in_play`
+- `non_play_type`
+- `rally_completeness`
+- `action_tags`
+- `context_tags`
+- `value_tags`
+- `model_confidence`
+
+### `coverage_report`
+必填字段：
+- `required_roles: object`
+- `soft_roles: object`
+- `coverage_gap: string[]`
+- `serve_presence_status: user-confirmed-present / user-confirmed-absent / model-likely-present / model-likely-absent / uncertain`
+- `selected_summary: object`
+
+## 模型 prompt
+每个候选使用固定任务 prompt。
+
+模板：
+
+```text
+你是网球训练视频片段筛选器。你只判断当前候选片段是否适合进入后续技术分析，不输出训练建议。
+
+输入包括按时间顺序排列的关键帧，以及候选元数据和 CV 证据摘要。
+
+请只基于这些关键帧判断：
+1. 这段是否真正在打网球。
+2. 是否只是休息、捡球、等待、走动或镜头噪声。
+3. rally 是否基本完整。
+4. 是否能看到明显正手、反手或发球。
+5. 是否具备复盘价值：亮点、好例子或问题样本。
+
+如果证据不足，必须输出 uncertain。不要因为动作不好就排除问题样本。不要输出最终技术诊断。
+
+必须严格按 JSON schema 输出，不要输出 schema 之外的字段。
+```
+
+## 模型 JSON Schema
+实现层应使用等价 JSON Schema 约束 `model_judgement`。
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "schema_version": {"const": "model_judgement.v1"},
+    "candidate_id": {"type": "string"},
+    "in_play": {"enum": ["yes", "no", "uncertain"]},
+    "non_play_type": {"enum": ["none", "picking_ball", "resting", "walking", "waiting", "camera_noise", "uncertain"]},
+    "rally_completeness": {"enum": ["complete", "partial_start_missing", "partial_end_missing", "multi_rally", "uncertain"]},
+    "action_tags": {"type": "array", "items": {"enum": ["forehand", "backhand", "serve"]}},
+    "context_tags": {"type": "array", "items": {"enum": ["baseline", "midcourt", "running", "stationary"]}},
+    "value_tags": {"type": "array", "items": {"enum": ["highlight", "good_example", "problem_example"]}},
+    "reject_reasons": {"type": "array", "items": {"type": "string"}},
+    "selection_reason": {"type": "string"},
+    "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0}
+  },
+  "required": [
+    "schema_version",
+    "candidate_id",
+    "in_play",
+    "non_play_type",
+    "rally_completeness",
+    "action_tags",
+    "context_tags",
+    "value_tags",
+    "reject_reasons",
+    "selection_reason",
+    "confidence"
+  ],
+  "additionalProperties": false
+}
+```
+
+## 执行流程
+### 1. 导入 04 输出
+读取 `manifest.json` 和 `point_clips/`，按源视频时间排序。
+
+如果没有可用 `point_clips`，直接输出：
+- `selection_status = no_candidates`
+- `infeasible_reasons = ["empty-point-clips"]`
+
+### 2. CV 高召回候选生成
+对每个 `point_clip` 执行轻量扫描，生成 `0-3` 个候选窗口。
+
+候选类型：
+- `motion_dense`：运动和音频证据密集的窗口。
+- `rally_wide`：覆盖更完整回合的宽窗口。
+- `opening_probe`：靠近片头，服务发球或回合开局识别。
+- `recovery_probe`：捕捉可能的问题样本，例如被动回位、失衡、追球。
+
+CV 层必须避免过度自信：
+- 不在这一层强行判定正手、反手、发球。
+- 不因为“看起来像休息”就直接丢弃，除非视频几乎无有效画面。
+- 不因为 dead time 偏高就直接丢弃长 rally 候选。
+
+### 3. 候选池压缩
+默认规模：
+- `cv_candidate_pool = 18`
+- 可接受范围：`12-24`
+- `selected_clips = 6`
+- `review_queue <= 6`
+
+压缩规则：
+- 同一 `point_clip` 默认最多保留 `2` 个候选。
+- 时间高度重叠的候选保留 CV 证据更完整者。
+- 保留不同时间段、不同运动强度、不同候选类型。
+- 候选不足时宁可减少最终样本，也不制造低质量候选。
+
+### 4. 模型输入构建
+为每个 `cv_candidate` 构建 `model_input_package`。
+
+关键帧抽取规则：
+- 默认 `9` 帧。
+- 至少包含候选窗口的 `0% / 50% / 100%` 附近。
+- 剩余帧优先取运动峰值附近。
+- 输出 JPEG，长边不超过 `768px`。
+
+候选短视频：
+- 从 `export_window_proposal` 导出。
+- 命名为 `candidate.mp4`。
+- 只用于人工复核和后续调试，不作为 v1.0.1 模型输入主路径。
+
+### 5. 本地视觉模型判断
+对每个候选调用 `local_vlm_runner`。
+
+处理规则：
+- 成功返回合法 JSON：写入 `judgement.json`。
+- 返回非法 JSON：用同一输入重试一次。
+- 重试仍失败：候选进入 `review_queue`，并记录 `reject_reasons = ["invalid-model-output"]`。
+- 模型不可用：终止模型阶段，输出 `selection_status = model_unavailable`。
+- fallback 模型可用但主模型不可用：继续执行，并输出 `selection_status = model_degraded`，除非最终结果仍不完整。
+
+### 6. 候选过滤
+硬过滤：
+- `in_play = no` 且 `confidence >= 0.70`：排除。
+- `non_play_type` 为 `picking_ball / resting / waiting / walking / camera_noise` 且 `confidence >= 0.70`：排除。
+
+降权或 review：
+- `in_play = uncertain`。
+- `rally_completeness = partial_start_missing / partial_end_missing`。
+- `rally_completeness = multi_rally`。
+- `confidence < 0.70` 但候选覆盖稀缺角色。
+
+保留规则：
+- `problem_example` 不能因为动作差而被过滤。
+- 候选只要有独特覆盖价值且模型不明确否定，可以进入 review。
+
+### 7. Rerank 与覆盖选择
+选择顺序固定为：
+1. 过滤高置信非打球候选。
+2. 根据 `serve_presence` 判断是否需要发球槽位。
+3. 先填硬覆盖槽位：`forehand`、`backhand`、`serve-if-required`。
+4. 再补软覆盖：`highlight`、`problem_example`、`good_example`、`baseline/midcourt`、`running/stationary`。
+5. 最后按综合分填满到 `selected_size`。
+6. 对最终结果做一次去重与覆盖回检。
+
+综合分：
+
+```text
+selection_score =
+  0.35 * model_value_score
+  + 0.25 * in_play_score
+  + 0.15 * completeness_score
+  + 0.15 * coverage_bonus
+  + 0.10 * diversity_bonus
+  - risk_penalty
+```
+
+映射规则：
+- `model_value_score = max(highlight, good_example, problem_example)`，有对应 `value_tags` 记为 `1.0`，否则 `0.4`。
+- `in_play_score = 1.0 / 0.5 / 0.0` 对应 `yes / uncertain / no`。
+- `completeness_score = 1.0` for `complete`，`0.55` for `multi_rally`，`0.35` for partial，`0.45` for `uncertain`。
+- `coverage_bonus = 1.0` 若补齐缺失硬槽位，`0.6` 若补齐软槽位，`0.0` otherwise。
+- `diversity_bonus = 1.0` 若与已选候选不同 `clip_id` 且不同主标签，`0.4` 若只满足其中之一，`0.0` otherwise。
+- `risk_penalty = 0.25` 若存在高风险 CV flag，`0.15` 若模型置信度低于 `0.70`，可叠加。
+
+最终规则：
+- `in_play = no` 的候选不能进入 `selected_clips`。
+- 高置信 `non_play_type != none` 的候选不能进入 `selected_clips`。
+- 若可用候选不足，不强行补满，输出 `constrained_incomplete`。
+
+### 8. Review queue
+以下候选必须进入 `review_queue`：
+- 覆盖硬约束但模型置信度不足。
+- 模型认为 `uncertain` 但 CV 证据显示可能有价值。
+- 回合边界不完整但候选具备独特技术价值。
+- 模型输出不合法或重复失败。
+- 最终集合仍缺少关键覆盖项。
+
+`review_queue` 的目标不是替代 selection，而是把人工确认压缩到极少数高价值不确定项。
 
 ## 与 04 segmentation 的关系
-05 必须接受 04 当前现实：
-- 04 的主产物仍是 `point clip`
-- 某些片段会“略粘”
-- 04 当前不承诺完整 `break` 时间轴
+05 v1.0.1 接受 04 当前现实：
+- 04 输出仍然是 `point_clips`。
+- 04 允许“略粘”。
+- 04 不需要先提供完美 rally 边界。
 
-因此 05 的策略不是要求 04 先变完美，而是：
-- 把 04 的 `point clip` 视为候选容器
-- 在容器内部进一步定位分析焦点
-- 把 04 的边界风险显式传递给下游
+05 不回写 04，也不要求 04 改成模型驱动切片。
 
-05 不应回写或隐式篡改 04 的切片结果。
-如果发现问题，只能：
-- 在当前 `selection package` 中标注
-- 或把结论沉淀到 `validation`
+如果 04 的 `point_clip` 过粘：
+- 05 在内部生成多个 `cv_candidate`。
+- 本地视觉模型判断 `multi_rally`。
+- selector 只选最可分析、边界最清晰的候选。
 
 ## 与 06 analysis 的关系
-05 输出给 06 的不是“随便几段视频”，而是带上下文的样本集合。
+05 输出给 06 的是 `selected_clips`。
 
-06 至少应收到：
-- `selected_clips`
-- `selection_reasons`
-- `coverage_roles`
-- `semantic_tags`
+每个 `selected_clip` 必须包含：
+- `focus_window`：分析焦点，兼容 06 当前命名。
+- `export_window`：实际导出给 06 观看的视频窗口。
+- `model_judgement`：候选级语义判断。
+- `cv_evidence`：候选生成证据。
+- `coverage_roles`：该片段承担的覆盖角色。
+- `needs_review`：是否需要人工确认。
+
+06 应优先消费 `export_window` 对应导出视频；若需要在 prompt 中强调重点，则引用 `focus_window`。
+
+## 与 07 persistence 的关系
+07 保存 session note 时，应把每个入选片段的以下内容作为稳定证据保存：
+- `selection_id`
+- `candidate_id`
+- `exported_clip_path`
 - `focus_window`
+- `export_window`
+- `coverage_roles`
+- `model_judgement` 摘要
 - `needs_review`
+- `traceability` 到 `selection-package.json`
 
-这样 06 可以：
-- 优先看 `focus_window` 而不是整段长片
-- 理解为什么某个片段被选中
-- 区分“亮点样本”和“问题样本”
-- 在模型输出中继承 05 的不确定性标记
+不要把完整 `cv_candidate_pool` 或全部关键帧复制进 Obsidian。
 
 ## 降级路径
-### 1. 没有姿态能力
-退化为：
-- 质量过滤
-- 时序窗口定位
-- 基于站位和运动的粗覆盖选择
+### 1. 模型不可用
+输出：
+- `selection_status = model_unavailable`
+- `cv_candidate_pool`
+- `model_input_packages`
+- `review_queue`
+- `selected_clips = []`
 
-此时若无法确认 `forehand / backhand / serve`，必须把候选送入 `review_queue`，不能伪装成已满足硬约束。
+不输出伪自动的 `selected_clips`，除非用户显式允许 `cv_only_fallback`。
 
-### 2. 没有本地小模型
-退化为：
-- 完全依赖规则特征、时序特征与可选姿态特征
-- 保留更大的 `review_queue`
+### 2. fallback 模型可用
+如果 `qwen2.5vl:7b` 不可用但 `qwen2.5vl:3b` 可用：
+- 继续运行。
+- `selection_status` 初始记为 `model_degraded`。
+- 若最终覆盖不足，最终状态改为 `constrained_incomplete`。
 
-这不影响首版可运行性，只会降低部分语义标签的复核能力。
+### 3. 模型输出不稳定
+采用：
+- 固定 schema。
+- 单候选最多一次重试。
+- 失败进入 `review_queue`。
 
-### 3. 切片结果过粘
-退化为：
-- 尽量只输出内部 `focus_window`
-- 降低整段 `clip` 的直接入选权重
+不通过自由文本猜测结构化字段。
 
-### 4. 视频质量不稳定
-退化为：
-- 优先保留仍能看清动作主干的片段
-- 缩小最终集规模
-- 保留 `quality_flags`
+### 4. 发球是否存在不确定
+若用户未指定 `serve_presence`，以模型对候选池的判断为准。
 
-### 5. 发球是否存在无法确认
-退化为：
-- 输出 `serve_presence_uncertain`
-- 保留最高 `serve_prob` 的候选进入 `review_queue`
+如果模型也不确定：
+- 输出 `serve_presence_status = uncertain`。
+- 不把缺发球视为失败。
+- 保留最高价值发球疑似候选进入 `review_queue`。
 
-## 当前明确暂缓的能力
-以下能力当前不应承诺为首版已具备：
-- 精确到每一次击球的自动识别
-- 精确的球轨迹和落点重建
-- 基于大模型或云端服务的精选主路径
-- 训练型视频嵌入和大规模聚类
-- 跨多次 session 的偏好学习
-- 直接根据 05 输出最终技术诊断结论
+## 实现模块
+新版实现建议拆为四个模块，哪怕初期仍在一个脚本中，也应保持函数边界清晰：
+- `cv_candidate_builder`：读取 04 输出，生成候选和 CV 证据。
+- `model_input_builder`：导出候选短视频与关键帧包。
+- `local_vlm_runner`：调用 Ollama 并校验 `model_judgement`。
+- `coverage_selector`：融合模型判断、覆盖约束和去重逻辑，输出最终 package。
 
-## 当前推荐的首版结果形态
-首版建议输出两层结果：
+模块边界：
+- CV 模块不写模型语义字段。
+- 模型模块不重新扫描长视频。
+- selector 不重新解释画面，只消费结构化判断。
 
-### `candidate_pool`
-更宽的候选池，供调试和少量人工确认使用。
+## 测试与验收场景
+实现 v1.0.1 时至少覆盖以下场景：
+- `no_candidates`：空 `point_clips` 输出 `selection_status = no_candidates`。
+- `model_unavailable`：Ollama 不可用时输出候选池和空 `selected_clips`。
+- `invalid_model_output`：非法 JSON 重试一次，仍失败进入 `review_queue`。
+- `non_play_filter`：高置信 `picking_ball / resting / walking` 不进入 `selected_clips`。
+- `serve_absent`：`serve_presence = absent` 时不要求发球槽位。
+- `candidate_shortage`：可用候选不足时不强行补满。
+- `analysis_compat`：每个 `selected_clip` 必须包含 `focus_window`、`export_window`、`model_judgement` 和 `semantic_tags`。
+- `traceability`：package 能回溯到 run dir、候选输入包、模型响应和导出片段。
 
-建议规模：
-- `10-16`
+## 当前明确不做
+本版本不做：
+- 云端模型主路径。
+- `MLX/VLM` 第一版 adapter。
+- 专项训练或微调。
+- 网球球路 / 落点 / 旋转重建。
+- 专业动作技术诊断。
+- 跨 session 偏好学习。
+- 用复杂规则继续模拟视觉语义理解。
 
-### `selected_clips`
-最终送入 06 的代表样本集。
-
-建议规模：
-- `6-8`
-
-如果本次训练内容很单一，可收缩到：
-- `4-6`
-
-如果本次素材特别杂，但覆盖要求更高，可放宽到：
-- `8-10`
+## 参考资料
+- Ollama Vision: https://docs.ollama.com/capabilities/vision
+- Ollama Structured Outputs: https://docs.ollama.com/capabilities/structured-outputs
+- Ollama qwen2.5vl: https://ollama.com/library/qwen2.5vl
 
 ## 当前结论
-05 selection 的首版，不应试图在本地一步到位理解完整网球语义。
+`v1.0.1` 的关键变化是把 selection 从“方向正确的架构草案”补齐为“可以直接编码的实现规格”。
 
-更务实的路径是：
-- 接受 04 当前“可用但略粘”的现实。
-- 把精选对象从整段 `point clip` 提升为带 `focus_window` 的 `analysis candidate`。
-- 用本地轻量信号先解决“代表性、覆盖性、精彩度、问题暴露”四个核心问题。
-- 对 `正手 / 反手 / 发球` 这类硬约束，采用“自动粗识别 + 显式约束 + 小范围 review queue”。
-- 若本机 `ollama` 可用，则把本地小模型放在 `review_queue` 和低置信度候选复核层，而不是放到主筛选路径上。
+工程实现时不应再自行决定：
+- 第一版本地视觉模型 runner。
+- 模型输入形态。
+- JSON schema。
+- rerank 权重。
+- 下游兼容字段。
+- 模型失败时的状态语义。
 
-这样可以在当前这台 `Mac` 上先把链路跑通，并且让 06 analysis 收到一组更像“教练会挑出来的样本”，而不是一组随机长片。
+后续调优应优先围绕：
+- 候选池召回率。
+- 模型判断 schema 稳定性。
+- rerank 结果的人工抽检命中率。
+- review queue 是否足够小且足够有用。

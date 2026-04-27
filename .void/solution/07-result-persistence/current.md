@@ -23,6 +23,19 @@
 - 用于复用的上下文摘要
 - `traceability` 信息
 
+当 `selected_clips` 来自 05 selection v1.0.1 时，每个片段引用至少应包含：
+- `selection_id`
+- `candidate_id`
+- `clip_id`
+- `source_video_id`
+- `exported_clip_path`
+- `focus_window`
+- `export_window`
+- `coverage_roles`
+- `model_judgement` 摘要
+- `needs_review`
+- 指向 `selection-package.json` 的 `traceability`
+
 ### 输出
 结果保存层的标准输出是一个可持续消费的 session note，至少满足：
 - 人可以直接读懂这次训练的结论、问题和行动项
@@ -63,6 +76,12 @@ session note 是这次训练的唯一事实源，其他派生内容都应回指�
 - 关联字段，如 `source_videos`、`selected_clips`、`related_sessions`
 - 检索字段，如 `tags`、`next_focus`
 
+`selected_clips` 在 frontmatter 中只保存稳定索引，不保存完整模型响应。建议保存：
+- `selection_id`
+- `exported_clip_path`
+- `coverage_roles`
+- `needs_review`
+
 ### 正文
 正文承载解释性内容和可读性更强的分析结果。
 
@@ -73,6 +92,13 @@ session note 是这次训练的唯一事实源，其他派生内容都应回指�
 - 行动项
 - 追溯关系
 - 给后续分析使用的 `Prompt Capsule`
+
+每个片段正文说明应保留：
+- 05 的入选理由
+- 06 的技术观察
+- `model_judgement` 的简短摘要
+- `focus_window / export_window`
+- 是否需要人工复核
 
 职责划分原则很简单：
 - 稳定索引用 `frontmatter`
@@ -133,6 +159,8 @@ session note 是这次训练的唯一事实源，其他派生内容都应回指�
 - 下次训练重点
 
 不建议把全文复制到下一次 prompt。更稳的方式是让后续流程引用 `session note` 的稳定结构，而不是复刻整篇内容。
+
+05 selection 的完整中间产物，例如 `cv_candidate_pool`、关键帧、模型原始响应，不应复制进 Obsidian 正文。session note 只应保存可追溯引用和必要摘要，完整证据保留在 `.work/clips/.../selection_runs/` 中。
 
 ## 降级路径
 主路径不可用时，优先降级写入方式，而不是放弃结构。
