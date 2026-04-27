@@ -12,3 +12,35 @@ raw_dir = "/absolute/path/to/raw/videos"
 
 # Working directory for generated rally clips and other derived video assets.
 clips_dir = "/absolute/path/to/working/clips"
+
+[selection]
+# Number of CV-generated candidates to send into local vision-model reranking.
+candidate_pool_size = 18
+
+# Target number of representative clips selected for downstream analysis.
+selected_size = 6
+
+# Number of ordered JPEG keyframes passed to the local vision model per candidate.
+frames_per_candidate = 9
+
+[selection.local_vlm]
+# v1.0.1 supports Ollama as the first local VLM runner.
+provider = "ollama"
+
+# Ollama chat endpoint used by the selection runner.
+endpoint = "http://localhost:11434/api/chat"
+
+# Main local vision-language model.
+model = "qwen2.5vl:7b"
+
+# Lower-resource fallback model when the main model is unavailable.
+fallback_model = "qwen2.5vl:3b"
+
+# Request timeout for one candidate judgement.
+timeout_seconds = 120
+
+# Retry count for invalid structured JSON output.
+max_retries = 1
+
+# Keep deterministic for schema-constrained model judgements.
+temperature = 0

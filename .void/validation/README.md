@@ -16,6 +16,8 @@
 - 当前方案：[视频精选架构（Current）](../solution/05-video-selection/current.md)
 - 历史方案：[视频精选方案历史（V1）](../solution/05-video-selection/history/v1.md)
 - 历史方案：[视频精选方案历史（V4）](../solution/05-video-selection/history/v4.md)
+- 历史方案：[视频精选方案历史（v0.4.0）](../solution/05-video-selection/history/v0.4.0.md)
+- 历史方案：[视频精选方案历史（v1.0.0）](../solution/05-video-selection/history/v1.0.0.md)
 
 ## 当前目录结构
 当前目录目前有两个验证子域：
@@ -29,17 +31,26 @@
 - 误拆修复验证：[2026-04-22-video-segmentation-motion-priority-fix](./2026-04-22-video-segmentation-motion-priority-fix.md)
 - 真实使用抽样复核：[2026-04-24-img3076-segmentation-sampling](./2026-04-24-img3076-segmentation-sampling.md)
 
-视频精选当前有 `4` 份验证，形成一条连续反馈链：
+视频精选当前验证记录按主题分为：
+- 旧 CV-heavy 主线的连续反馈链
+- 跨视频通用性检查
+- `v1.0.0` 主版本升级设计验证
+
+旧 CV-heavy 主线的反馈链：
 - 回合完整性反馈与修正：[2026-04-25-video-selection-img3076-rally-completeness](./2026-04-25-video-selection-img3076-rally-completeness.md)
 
-视频精选当前还有 `1` 份后续边界反馈：
+后续边界反馈：
 - 回合起点边界反馈与修正：[2026-04-26-video-selection-img3076-rally-start-boundary](./2026-04-26-video-selection-img3076-rally-start-boundary.md)
 
-视频精选当前还有 `1` 份后续修复验证：
+后续修复验证：
 - 回合起点修复验证：[2026-04-26-video-selection-img3076-rally-start-repair](./2026-04-26-video-selection-img3076-rally-start-repair.md)
 
-视频精选当前还有 `1` 份跨视频通用性检查：
+跨视频通用性检查：
 - `img_3026` 通用性检查：[2026-04-26-video-selection-img3026-generalization-check](./2026-04-26-video-selection-img3026-generalization-check.md)
+
+主版本升级设计验证：
+- `v1.0.0` 重设计验证：[2026-04-28-video-selection-v1.0.0-redesign](./2026-04-28-video-selection-v1.0.0-redesign.md)
+- `v1.0.1` 实现规格补强验证：[2026-04-28-video-selection-v1.0.1-implementation-spec](./2026-04-28-video-selection-v1.0.1-implementation-spec.md)
 
 ## 与 Void v0.2.2 的迁移约定
 - 现有验证文档保持原文件名与原链接，不做追溯性批量重命名。

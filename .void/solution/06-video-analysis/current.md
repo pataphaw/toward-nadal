@@ -17,9 +17,16 @@
 ## 输入与输出
 ### 输入
 分析层的标准输入由三部分组成：
-- `selected_clips`：精选后的样本列表，至少带 `clip_id`、来源视频、`focus_window`、入选理由、覆盖角色、情境标签与 `needs_review`
+- `selected_clips`：精选后的样本列表，至少带 `clip_id`、来源视频、`focus_window`、`export_window`、`model_judgement`、`cv_evidence`、入选理由、覆盖角色与 `needs_review`
 - `context_pack`：从记忆中检索出的结构化上下文
 - `task_spec`：本次分析目标，例如技术复盘、问题定位、训练重点确认
+
+`selected_clips` 来自 05 selection v1.0.1 时，分析层应识别以下字段：
+- `export_window`：实际导出给分析模型观看的视频窗口。
+- `focus_window`：候选内部最值得关注的分析焦点，兼容旧命名。
+- `model_judgement`：05 本地视觉模型对候选是否 in-play、是否完整、动作与价值标签的判断。
+- `cv_evidence`：05 生成候选时的运动、质量和边界证据。
+- `semantic_tags`：由 `model_judgement` 派生的兼容字段。
 
 ### 输出
 输出应满足两类用途：
@@ -46,7 +53,7 @@
 推荐流程：
 1. 读取本次训练的 `selected_clips`
 2. 汇总可用的长期、中期、短期上下文
-3. 按模型能力选择输入形态，并优先消费 `focus_window`
+3. 按模型能力选择输入形态，并优先消费 `export_window` 对应导出视频，同时在 prompt 中标注 `focus_window`
 4. 组装 prompt 并发起分析
 5. 校验输出 schema
 6. 写回 Obsidian 目标路径
@@ -80,7 +87,7 @@ Prompt 的目标是把任务边界、上下文和输出合同固定下来。
 2. `分析规则`：只基于证据和上下文，区分 `observed`、`inferred`、`uncertain`
 3. `用户上下文包`：只放会影响判断的稳定和近期信息
 4. `视频清单`：每个片段都带稳定引用
-   若上游提供 `focus_window`，这里应优先引用分析窗口，而不是默认整段长片
+   若上游提供 `export_window` 与 `focus_window`，这里应把 `export_window` 作为观看范围，把 `focus_window` 作为重点观察范围
 5. `输出合同`：要求按固定 schema 输出
 
 装配时要遵守两条原则：
@@ -125,6 +132,7 @@ Prompt 的目标是把任务边界、上下文和输出合同固定下来。
 - 模型能力先决定输入形态
 - 不要为了统一而牺牲有效信息
 - 同一套输出契约保持不变，便于横向替换模型
+- 05 的 `model_judgement` 是 selection 证据，不是最终技术诊断；06 可以引用它的不确定性，但不能把它当作最终结论
 
 ## 降级路径
 当主路径不可用时，优先降级输入，而不是放宽输出要求。
