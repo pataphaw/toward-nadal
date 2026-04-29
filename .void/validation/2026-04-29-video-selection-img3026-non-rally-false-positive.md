@@ -10,6 +10,11 @@
 
 ## 验证对象
 - 方案版本：`v1.0.1-implementation-ready-local-vlm-rerank`
+- 本地模型依赖（本次实跑）：
+  - `provider = ollama`
+  - `endpoint = http://localhost:11434/api/chat`
+  - `model = qwen2.5vl:7b`
+  - `fallback_model = qwen2.5vl:3b`
 - 运行包：
   - `selection-package.json`：`/Users/pataphaw/Projects/toward-nadal/.work/clips/img_3026/20260422-074627/selection_runs/20260429-img3026-vlm-final/selection-package.json`
   - 导出目录：`/Users/pataphaw/Projects/toward-nadal/.work/clips/img_3026/20260422-074627/selected_clips/20260429-img3026-vlm-final`
