@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import math
 import pathlib
 import subprocess
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from typing import Any, Iterable, Sequence
 
 import numpy as np
@@ -45,8 +49,17 @@ DEFAULTS = {
     "rally_quiet_active_ratio_threshold": 0.035,
     "rally_quiet_gap_seconds": 3.5,
     "max_focus_windows_per_clip": 3,
-    "candidate_pool_size": 12,
+    "candidate_pool_size": 18,
     "selected_size": 6,
+    "frames_per_candidate": 9,
+    "config_path": "config.toml",
+    "local_vlm_provider": "ollama",
+    "local_vlm_endpoint": "http://localhost:11434/api/chat",
+    "local_vlm_model": "qwen2.5vl:7b",
+    "local_vlm_fallback_model": "qwen2.5vl:3b",
+    "local_vlm_timeout_seconds": 120,
+    "local_vlm_max_retries": 1,
+    "local_vlm_temperature": 0.0,
     "serve_exists_threshold": 0.58,
     "serve_uncertain_floor": 0.33,
     "slot_threshold": 0.45,
@@ -67,6 +80,56 @@ DEFAULTS = {
     "opencv_diff_percentile": 92.0,
     "opencv_min_component_area_ratio": 0.0025,
 }
+
+MODEL_JUDGEMENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "schema_version": {"const": "model_judgement.v1"},
+        "candidate_id": {"type": "string"},
+        "in_play": {"enum": ["yes", "no", "uncertain"]},
+        "non_play_type": {
+            "enum": ["none", "picking_ball", "resting", "walking", "waiting", "camera_noise", "uncertain"]
+        },
+        "rally_completeness": {
+            "enum": ["complete", "partial_start_missing", "partial_end_missing", "multi_rally", "uncertain"]
+        },
+        "action_tags": {"type": "array", "items": {"enum": ["forehand", "backhand", "serve"]}},
+        "context_tags": {"type": "array", "items": {"enum": ["baseline", "midcourt", "running", "stationary"]}},
+        "value_tags": {"type": "array", "items": {"enum": ["highlight", "good_example", "problem_example"]}},
+        "reject_reasons": {"type": "array", "items": {"type": "string"}},
+        "selection_reason": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+    },
+    "required": [
+        "schema_version",
+        "candidate_id",
+        "in_play",
+        "non_play_type",
+        "rally_completeness",
+        "action_tags",
+        "context_tags",
+        "value_tags",
+        "reject_reasons",
+        "selection_reason",
+        "confidence",
+    ],
+    "additionalProperties": False,
+}
+
+MODEL_PROMPT_TEMPLATE = """你是网球训练视频片段筛选器。你只判断当前候选片段是否适合进入后续技术分析，不输出训练建议。
+
+输入包括按时间顺序排列的关键帧，以及候选元数据和 CV 证据摘要。
+
+请只基于这些关键帧判断：
+1. 这段是否真正在打网球。
+2. 是否只是休息、捡球、等待、走动或镜头噪声。
+3. rally 是否基本完整。
+4. 是否能看到明显正手、反手或发球。
+5. 是否具备复盘价值：亮点、好例子或问题样本。
+
+如果证据不足，必须输出 uncertain。不要因为动作不好就排除问题样本。不要输出最终技术诊断。
+
+必须严格按 JSON schema 输出，不要输出 schema 之外的字段。"""
 
 
 def run_command(args: Sequence[str], *, capture_stdout: bool = False) -> str:
@@ -109,6 +172,7 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Segmentation run directory, or its point_clips/ child directory.",
     )
+    parser.add_argument("--config", default=DEFAULTS["config_path"], help="Optional local config.toml path.")
     parser.add_argument(
         "--output-dir",
         help="Optional output directory. Defaults to <run-dir>/selection_runs/<selection-run-id>.",
@@ -131,6 +195,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--candidate-pool-size", type=int, default=DEFAULTS["candidate_pool_size"])
     parser.add_argument("--selected-size", type=int, default=DEFAULTS["selected_size"])
+    parser.add_argument("--frames-per-candidate", type=int, default=DEFAULTS["frames_per_candidate"])
     parser.add_argument("--analysis-fps", type=float, default=DEFAULTS["analysis_fps"])
     parser.add_argument("--analysis-scale", default=DEFAULTS["analysis_scale"])
     parser.add_argument(
@@ -139,10 +204,13 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="Override whether this source video should be treated as containing serve clips.",
     )
-    parser.add_argument(
-        "--ollama-model",
-        help="Reserved for optional local model integration. The first usable version keeps rule-only selection.",
-    )
+    parser.add_argument("--local-vlm-provider", default=DEFAULTS["local_vlm_provider"])
+    parser.add_argument("--local-vlm-endpoint", default=DEFAULTS["local_vlm_endpoint"])
+    parser.add_argument("--local-vlm-model", default=DEFAULTS["local_vlm_model"])
+    parser.add_argument("--local-vlm-fallback-model", default=DEFAULTS["local_vlm_fallback_model"])
+    parser.add_argument("--local-vlm-timeout-seconds", type=int, default=DEFAULTS["local_vlm_timeout_seconds"])
+    parser.add_argument("--local-vlm-max-retries", type=int, default=DEFAULTS["local_vlm_max_retries"])
+    parser.add_argument("--local-vlm-temperature", type=float, default=DEFAULTS["local_vlm_temperature"])
     return parser.parse_args()
 
 
@@ -1520,359 +1588,802 @@ def dedupe_selected_candidates(selected: list[dict[str, Any]]) -> list[dict[str,
     return deduped
 
 
-def build_candidate_pool(candidates: list[dict[str, Any]], *, candidate_pool_size: int) -> list[dict[str, Any]]:
-    remaining = sorted(candidates, key=lambda item: item["selection_score"], reverse=True)
-    pool: list[dict[str, Any]] = []
+def parse_simple_toml(path: pathlib.Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    current_section = ""
+    config: dict[str, Any] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current_section = line[1:-1].strip()
+            continue
+        if "=" not in line or not current_section:
+            continue
+        key, raw_value = [part.strip() for part in line.split("=", 1)]
+        if raw_value.startswith('"') and raw_value.endswith('"'):
+            value: Any = raw_value[1:-1]
+        elif raw_value.lower() in {"true", "false"}:
+            value = raw_value.lower() == "true"
+        else:
+            try:
+                value = int(raw_value)
+            except ValueError:
+                try:
+                    value = float(raw_value)
+                except ValueError:
+                    value = raw_value
+        config[f"{current_section}.{key}"] = value
+    return config
+
+
+def apply_config_defaults(args: argparse.Namespace) -> None:
+    config = parse_simple_toml(pathlib.Path(args.config).expanduser())
+    mapping = {
+        "selection.candidate_pool_size": ("candidate_pool_size", DEFAULTS["candidate_pool_size"]),
+        "selection.selected_size": ("selected_size", DEFAULTS["selected_size"]),
+        "selection.frames_per_candidate": ("frames_per_candidate", DEFAULTS["frames_per_candidate"]),
+        "selection.local_vlm.provider": ("local_vlm_provider", DEFAULTS["local_vlm_provider"]),
+        "selection.local_vlm.endpoint": ("local_vlm_endpoint", DEFAULTS["local_vlm_endpoint"]),
+        "selection.local_vlm.model": ("local_vlm_model", DEFAULTS["local_vlm_model"]),
+        "selection.local_vlm.fallback_model": ("local_vlm_fallback_model", DEFAULTS["local_vlm_fallback_model"]),
+        "selection.local_vlm.timeout_seconds": ("local_vlm_timeout_seconds", DEFAULTS["local_vlm_timeout_seconds"]),
+        "selection.local_vlm.max_retries": ("local_vlm_max_retries", DEFAULTS["local_vlm_max_retries"]),
+        "selection.local_vlm.temperature": ("local_vlm_temperature", DEFAULTS["local_vlm_temperature"]),
+    }
+    for config_key, (arg_name, default_value) in mapping.items():
+        if config_key not in config:
+            continue
+        if getattr(args, arg_name) != default_value:
+            continue
+        setattr(args, arg_name, config[config_key])
+
+
+def to_time_window(clip: dict[str, Any], start_offset: float, end_offset: float) -> dict[str, Any]:
+    return {
+        "source_clip_offset_start": round(start_offset, 3),
+        "source_clip_offset_end": round(end_offset, 3),
+        "absolute_start_time": round(float(clip["start_time"]) + start_offset, 3),
+        "absolute_end_time": round(float(clip["start_time"]) + end_offset, 3),
+        "absolute_timebase": "source_video_timeline",
+    }
+
+
+def candidate_kind_from_window_kind(window_kind: str) -> str:
+    lower = window_kind.lower()
+    if "opening" in lower:
+        return "opening_probe"
+    if "wide" in lower:
+        return "rally_wide"
+    if "recovery" in lower:
+        return "recovery_probe"
+    return "motion_dense"
+
+
+def build_cv_candidate_pool(raw_candidates: list[dict[str, Any]], *, candidate_pool_size: int) -> list[dict[str, Any]]:
+    remaining = sorted(raw_candidates, key=lambda item: float(item["window_value_score"]), reverse=True)
+    selected: list[dict[str, Any]] = []
+    per_clip_count: dict[str, int] = {}
     seen_kinds: set[str] = set()
-    seen_soft_roles: set[str] = set()
-    while remaining and len(pool) < candidate_pool_size:
+
+    while remaining and len(selected) < candidate_pool_size:
         best_index = -1
         best_score = -999.0
         for index, candidate in enumerate(remaining):
-            semantic_tags = candidate["semantic_tags"]
-            bonus = 0.0
-            if is_transit_motion_risk(candidate):
-                bonus -= 0.22
-            window_kind = candidate.get("window_kind", "dense")
-            if window_kind not in seen_kinds:
-                bonus += 0.08
-            if semantic_tags["serve_prob"] >= 0.32 and "serve-like" not in seen_soft_roles:
-                bonus += 0.09
-            if semantic_tags["movement_mode"]["label"] == "stationary" and "stationary" not in seen_soft_roles:
-                bonus += 0.08
-            if semantic_tags["value_roles"]["problem-example"] >= 0.56 and "problem-example" not in seen_soft_roles:
-                bonus += 0.07
-            if semantic_tags["value_roles"]["good-example"] >= 0.68 and "good-example" not in seen_soft_roles:
-                bonus += 0.04
-            for role in (
-                semantic_tags["court_zone"]["label"],
-                semantic_tags["side_zone"]["label"],
-                semantic_tags["movement_mode"]["label"],
-            ):
-                if role not in seen_soft_roles:
-                    bonus += 0.03
-            total = float(candidate["selection_score"]) + bonus
-            if total > best_score:
-                best_score = total
+            clip_id = str(candidate["clip_id"])
+            if per_clip_count.get(clip_id, 0) >= 2:
+                continue
+            overlap_pen = 0.0
+            for prev in selected:
+                if prev["clip_id"] != clip_id:
+                    continue
+                overlap = overlap_duration(
+                    candidate["focus_window"]["source_clip_offset_start"],
+                    candidate["focus_window"]["source_clip_offset_end"],
+                    prev["focus_window"]["source_clip_offset_start"],
+                    prev["focus_window"]["source_clip_offset_end"],
+                )
+                duration = max(
+                    0.001,
+                    candidate["focus_window"]["source_clip_offset_end"]
+                    - candidate["focus_window"]["source_clip_offset_start"],
+                )
+                overlap_pen = max(overlap_pen, overlap / duration)
+            kind = candidate_kind_from_window_kind(candidate.get("window_kind", "motion_dense"))
+            diversity_bonus = 0.08 if kind not in seen_kinds else 0.0
+            score = float(candidate["window_value_score"]) + diversity_bonus - 0.35 * overlap_pen
+            if score > best_score:
+                best_score = score
                 best_index = index
+        if best_index < 0:
+            break
         chosen = remaining.pop(best_index)
-        pool.append(chosen)
-        seen_kinds.add(chosen.get("window_kind", "dense"))
-        seen_soft_roles.update(
+        selected.append(chosen)
+        per_clip_count[chosen["clip_id"]] = per_clip_count.get(chosen["clip_id"], 0) + 1
+        seen_kinds.add(candidate_kind_from_window_kind(chosen.get("window_kind", "motion_dense")))
+
+    pool: list[dict[str, Any]] = []
+    for index, candidate in enumerate(selected, start=1):
+        clip = {
+            "clip_id": candidate["clip_id"],
+            "source_video_id": candidate["source_video_id"],
+            "start_time": candidate["clip_start_time"],
+        }
+        candidate_id = f"{candidate['clip_id']}-candidate-{index:02d}"
+        focus_window = candidate["focus_window"]
+        export_window = candidate.get("selected_clip_window", focus_window)
+        cv_evidence = {
+            "window_duration": float(candidate["window_metrics"]["window_duration"]),
+            "effective_motion_ratio": float(candidate["window_metrics"]["effective_play_ratio"]),
+            "dead_time_ratio": float(candidate["window_metrics"]["dead_time_ratio"]),
+            "peak_motion_score": float(candidate["window_metrics"]["peak_motion"]),
+            "avg_motion_score": float(candidate["window_metrics"]["avg_score"]),
+            "motion_span_x": float(candidate["window_metrics"]["centroid_summary"]["x_span"]),
+            "motion_path_length": float(candidate["window_metrics"]["centroid_summary"]["path_length"]),
+            "audio_interval_overlap": float(candidate["window_metrics"]["effective_play_ratio"]),
+            "quality_flags": list(candidate.get("quality_flags", [])),
+            "boundary_flags": [flag for flag in candidate.get("quality_flags", []) if "unresolved" in flag],
+        }
+        dedupe_key = hashlib.sha1(
+            (
+                f"{candidate['clip_id']}|{focus_window['source_clip_offset_start']:.3f}|"
+                f"{focus_window['source_clip_offset_end']:.3f}|{candidate_kind_from_window_kind(candidate.get('window_kind', ''))}"
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        pool.append(
             {
-                chosen["semantic_tags"]["court_zone"]["label"],
-                chosen["semantic_tags"]["side_zone"]["label"],
-                chosen["semantic_tags"]["movement_mode"]["label"],
+                "candidate_id": candidate_id,
+                "clip_id": candidate["clip_id"],
+                "source_video_id": candidate["source_video_id"],
+                "source_clip_path": candidate["source_clip_path"],
+                "candidate_kind": candidate_kind_from_window_kind(candidate.get("window_kind", "motion_dense")),
+                "candidate_window": to_time_window(
+                    clip,
+                    float(focus_window["source_clip_offset_start"]),
+                    float(focus_window["source_clip_offset_end"]),
+                ),
+                "export_window_proposal": to_time_window(
+                    clip,
+                    float(export_window["source_clip_offset_start"]),
+                    float(export_window["source_clip_offset_end"]),
+                ),
+                "cv_evidence": cv_evidence,
+                "cv_risk_flags": list(candidate.get("quality_flags", [])),
+                "dedupe_key": dedupe_key,
+                "source_clip_probe": candidate.get("source_clip_probe", {}),
+                "cv_pre_score": round(float(candidate.get("window_value_score", 0.0)), 3),
             }
         )
-        if chosen["semantic_tags"]["serve_prob"] >= 0.32:
-            seen_soft_roles.add("serve-like")
-        if chosen["semantic_tags"]["value_roles"]["problem-example"] >= 0.56:
-            seen_soft_roles.add("problem-example")
-        if chosen["semantic_tags"]["value_roles"]["good-example"] >= 0.68:
-            seen_soft_roles.add("good-example")
     return pool
 
 
-def select_final_candidates(
-    candidates: list[dict[str, Any]],
+def export_window_video(
+    *,
+    source_clip_path: pathlib.Path,
+    window: dict[str, Any],
+    output_path: pathlib.Path,
+) -> None:
+    start_offset = float(window["source_clip_offset_start"])
+    end_offset = float(window["source_clip_offset_end"])
+    duration = max(0.001, end_offset - start_offset)
+    run_command(
+        [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-hide_banner",
+            "-ss",
+            f"{start_offset:.3f}",
+            "-i",
+            str(source_clip_path),
+            "-t",
+            f"{duration:.3f}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "18",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            str(output_path),
+        ]
+    )
+
+
+def extract_candidate_frames(candidate_video_path: pathlib.Path, frames_dir: pathlib.Path, frame_count: int) -> list[str]:
+    probe = ffprobe_json(candidate_video_path)
+    duration = float(probe.get("format", {}).get("duration") or 0.0)
+    max_time = max(0.0, duration - 0.001)
+    base_positions = [0.0, 0.5, 1.0]
+    if frame_count > 3:
+        base_positions.extend(index / (frame_count - 1) for index in range(frame_count))
+    positions = []
+    seen = set()
+    for value in base_positions:
+        key = round(value, 4)
+        if key in seen:
+            continue
+        seen.add(key)
+        positions.append(value)
+    timestamps = [round(clamp(value, 0.0, 1.0) * max_time, 3) for value in positions[:frame_count]]
+    while len(timestamps) < frame_count:
+        timestamps.append(round(max_time, 3))
+
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    output_paths: list[str] = []
+    for index, ts in enumerate(timestamps):
+        frame_path = frames_dir / f"{index:03d}.jpg"
+        attempts = [ts, max(0.0, ts - 0.25), max(0.0, ts - 0.75), 0.0]
+        generated = False
+        last_error = ""
+        for attempt_ts in attempts:
+            command = [
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-hide_banner",
+                "-ss",
+                f"{attempt_ts:.3f}",
+                "-i",
+                str(candidate_video_path),
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale='if(gt(iw,ih),min(iw,768),-2)':'if(gt(ih,iw),min(ih,768),-2)'",
+                "-q:v",
+                "2",
+                "-strict",
+                "-1",
+                str(frame_path),
+            ]
+            try:
+                run_command(command)
+            except RuntimeError as exc:
+                last_error = str(exc)
+                continue
+            if frame_path.exists() and frame_path.stat().st_size > 0:
+                generated = True
+                break
+        if not generated:
+            raise RuntimeError(f"failed to extract frame {index} for {candidate_video_path}: {last_error[:200]}")
+        output_paths.append(str(frame_path))
+    return output_paths
+
+
+def build_model_input_packages(
+    cv_candidate_pool: list[dict[str, Any]],
+    output_dir: pathlib.Path,
+    *,
+    frames_per_candidate: int,
+) -> list[dict[str, Any]]:
+    model_inputs_dir = output_dir / "model_inputs"
+    model_inputs_dir.mkdir(parents=True, exist_ok=True)
+    packages: list[dict[str, Any]] = []
+    for candidate in cv_candidate_pool:
+        candidate_id = str(candidate["candidate_id"])
+        input_dir = model_inputs_dir / candidate_id
+        frames_dir = input_dir / "frames"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        candidate_video_path = input_dir / "candidate.mp4"
+        prompt_path = input_dir / "prompt.txt"
+        input_json_path = input_dir / "input.json"
+
+        export_window_video(
+            source_clip_path=pathlib.Path(candidate["source_clip_path"]),
+            window=candidate["export_window_proposal"],
+            output_path=candidate_video_path,
+        )
+        frame_paths = extract_candidate_frames(candidate_video_path, frames_dir, max(6, min(12, frames_per_candidate)))
+        prompt_path.write_text(MODEL_PROMPT_TEMPLATE, encoding="utf-8")
+
+        input_payload = {
+            "schema_version": "model_judgement.v1",
+            "candidate_id": candidate_id,
+            "candidate_window": candidate["candidate_window"],
+            "export_window_proposal": candidate["export_window_proposal"],
+            "cv_evidence": candidate["cv_evidence"],
+            "cv_risk_flags": candidate["cv_risk_flags"],
+            "frame_paths": frame_paths,
+        }
+        input_hash = hashlib.sha1(json.dumps(input_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        input_payload["input_hash"] = input_hash
+        input_json_path.write_text(json.dumps(input_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        package = {
+            "candidate_id": candidate_id,
+            "input_dir": str(input_dir),
+            "frames_dir": str(frames_dir),
+            "frame_paths": frame_paths,
+            "frame_count": len(frame_paths),
+            "candidate_video_path": str(candidate_video_path),
+            "prompt_path": str(prompt_path),
+            "input_json_path": str(input_json_path),
+            "schema_version": "model_judgement.v1",
+            "input_hash": input_hash,
+        }
+        packages.append(package)
+    return packages
+
+
+def parse_json_maybe_wrapped(raw: str) -> dict[str, Any]:
+    text = raw.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 3:
+            text = "\n".join(lines[1:-1]).strip()
+    return json.loads(text)
+
+
+def validate_model_judgement(payload: dict[str, Any], *, candidate_id: str) -> dict[str, Any]:
+    required = MODEL_JUDGEMENT_SCHEMA["required"]
+    for key in required:
+        if key not in payload:
+            raise ValueError(f"missing field: {key}")
+    if payload["schema_version"] != "model_judgement.v1":
+        raise ValueError("schema_version must be model_judgement.v1")
+    if payload["candidate_id"] != candidate_id:
+        raise ValueError("candidate_id mismatch")
+    enum_fields = {
+        "in_play": {"yes", "no", "uncertain"},
+        "non_play_type": {"none", "picking_ball", "resting", "walking", "waiting", "camera_noise", "uncertain"},
+        "rally_completeness": {"complete", "partial_start_missing", "partial_end_missing", "multi_rally", "uncertain"},
+    }
+    for field, allowed in enum_fields.items():
+        if payload[field] not in allowed:
+            raise ValueError(f"{field} out of enum")
+    array_enums = {
+        "action_tags": {"forehand", "backhand", "serve"},
+        "context_tags": {"baseline", "midcourt", "running", "stationary"},
+        "value_tags": {"highlight", "good_example", "problem_example"},
+    }
+    normalized = dict(payload)
+    for field, allowed in array_enums.items():
+        values = [str(item) for item in payload[field]]
+        if any(value not in allowed for value in values):
+            raise ValueError(f"{field} out of enum")
+        normalized[field] = sorted(set(values))
+    normalized["reject_reasons"] = [str(item) for item in payload["reject_reasons"]]
+    normalized["selection_reason"] = str(payload["selection_reason"])[:300]
+    confidence = float(payload["confidence"])
+    if confidence < 0.0 or confidence > 1.0:
+        raise ValueError("confidence out of range")
+    normalized["confidence"] = round(confidence, 3)
+    if normalized["in_play"] == "yes" and normalized["non_play_type"] not in {"none", "uncertain"}:
+        normalized["non_play_type"] = "uncertain"
+    if normalized["in_play"] == "no":
+        normalized["value_tags"] = []
+    return normalized
+
+
+def call_ollama_chat(
+    *,
+    endpoint: str,
+    model: str,
+    prompt: str,
+    image_paths: list[str],
+    candidate_payload: dict[str, Any],
+    timeout_seconds: int,
+    temperature: float,
+) -> tuple[dict[str, Any], str]:
+    images_base64 = [base64.b64encode(pathlib.Path(path).read_bytes()).decode("ascii") for path in image_paths]
+    user_prompt = (
+        f"{prompt}\n\n候选元数据与 CV 证据：\n"
+        f"{json.dumps(candidate_payload, ensure_ascii=False)}\n\n"
+        "请返回严格 JSON。"
+    )
+    payload = {
+        "model": model,
+        "stream": False,
+        "format": MODEL_JUDGEMENT_SCHEMA,
+        "options": {"temperature": float(temperature)},
+        "messages": [{"role": "user", "content": user_prompt, "images": images_base64}],
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(endpoint, data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+            raw_body = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"http_error:{exc.code}:{detail[:400]}")
+    except Exception as exc:
+        raise RuntimeError(f"request_error:{exc}")
+    response = json.loads(raw_body)
+    content = response.get("message", {}).get("content", "")
+    if not content:
+        raise RuntimeError("empty_model_content")
+    return parse_json_maybe_wrapped(content), raw_body
+
+
+def run_model_judgements(
+    model_input_packages: list[dict[str, Any]],
+    *,
+    endpoint: str,
+    primary_model: str,
+    fallback_model: str,
+    timeout_seconds: int,
+    max_retries: int,
+    temperature: float,
+) -> tuple[list[dict[str, Any]], bool, bool, str | None]:
+    judgements: list[dict[str, Any]] = []
+    any_success = False
+    used_fallback = False
+    models = [primary_model]
+    if fallback_model and fallback_model != primary_model:
+        models.append(fallback_model)
+
+    for package in model_input_packages:
+        candidate_id = str(package["candidate_id"])
+        candidate_payload = json.loads(pathlib.Path(package["input_json_path"]).read_text(encoding="utf-8"))
+        prompt = pathlib.Path(package["prompt_path"]).read_text(encoding="utf-8")
+        success = False
+        last_error = ""
+        transport_error = False
+        response_path = pathlib.Path(package["input_dir"]) / "model_response.json"
+        judgement_path = pathlib.Path(package["input_dir"]) / "judgement.json"
+
+        for model_name in models:
+            for _ in range(max(1, max_retries + 1)):
+                try:
+                    raw_judgement, raw_response = call_ollama_chat(
+                        endpoint=endpoint,
+                        model=model_name,
+                        prompt=prompt,
+                        image_paths=list(package["frame_paths"]),
+                        candidate_payload=candidate_payload,
+                        timeout_seconds=timeout_seconds,
+                        temperature=temperature,
+                    )
+                    judgement = validate_model_judgement(raw_judgement, candidate_id=candidate_id)
+                    response_path.write_text(raw_response, encoding="utf-8")
+                    judgement["model_name"] = model_name
+                    judgement_path.write_text(json.dumps(judgement, ensure_ascii=False, indent=2), encoding="utf-8")
+                    judgements.append(judgement)
+                    any_success = True
+                    if model_name == fallback_model and model_name != primary_model:
+                        used_fallback = True
+                    success = True
+                    break
+                except RuntimeError as exc:
+                    last_error = str(exc)
+                    transport_error = True
+                except (json.JSONDecodeError, ValueError) as exc:
+                    last_error = str(exc)
+                    transport_error = False
+                    continue
+            if success:
+                break
+        if not success:
+            if transport_error and not any_success:
+                return [], any_success, used_fallback, last_error
+            fallback = {
+                "schema_version": "model_judgement.v1",
+                "candidate_id": candidate_id,
+                "in_play": "uncertain",
+                "non_play_type": "uncertain",
+                "rally_completeness": "uncertain",
+                "action_tags": [],
+                "context_tags": [],
+                "value_tags": [],
+                "reject_reasons": ["invalid-model-output", last_error[:160]],
+                "selection_reason": "Model output invalid after retry.",
+                "confidence": 0.0,
+                "model_name": None,
+            }
+            judgement_path.write_text(json.dumps(fallback, ensure_ascii=False, indent=2), encoding="utf-8")
+            judgements.append(fallback)
+    return judgements, any_success, used_fallback, None
+
+
+def derive_semantic_tags(judgement: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "in_play": judgement["in_play"],
+        "non_play_type": judgement["non_play_type"],
+        "rally_completeness": judgement["rally_completeness"],
+        "action_tags": list(judgement["action_tags"]),
+        "context_tags": list(judgement["context_tags"]),
+        "value_tags": list(judgement["value_tags"]),
+        "model_confidence": float(judgement["confidence"]),
+    }
+
+
+def candidate_main_tag(semantic_tags: dict[str, Any]) -> str:
+    for key in ("value_tags", "action_tags", "context_tags"):
+        values = semantic_tags.get(key) or []
+        if values:
+            return str(values[0])
+    return "unknown"
+
+
+def candidate_is_hard_filtered(judgement: dict[str, Any]) -> bool:
+    confidence = float(judgement["confidence"])
+    if judgement["in_play"] == "no":
+        return True
+    if judgement["in_play"] == "no" and confidence >= 0.7:
+        return True
+    if judgement["non_play_type"] != "none" and judgement["non_play_type"] != "uncertain" and confidence >= 0.7:
+        return True
+    return False
+
+
+def coverage_roles_from_semantics(semantic_tags: dict[str, Any]) -> list[str]:
+    roles = set()
+    roles.update(semantic_tags["action_tags"])
+    roles.update(semantic_tags["context_tags"])
+    roles.update(semantic_tags["value_tags"])
+    return sorted(roles)
+
+
+def compute_selection_score(
+    *,
+    candidate: dict[str, Any],
+    judgement: dict[str, Any],
+    selected: list[dict[str, Any]],
+    missing_hard: set[str],
+    missing_soft: set[str],
+) -> float:
+    semantic_tags = derive_semantic_tags(judgement)
+    model_value_score = 1.0 if semantic_tags["value_tags"] else 0.4
+    in_play_score = {"yes": 1.0, "uncertain": 0.5, "no": 0.0}[semantic_tags["in_play"]]
+    completeness_score = {
+        "complete": 1.0,
+        "multi_rally": 0.55,
+        "partial_start_missing": 0.35,
+        "partial_end_missing": 0.35,
+        "uncertain": 0.45,
+    }[semantic_tags["rally_completeness"]]
+    candidate_roles = set(coverage_roles_from_semantics(semantic_tags))
+    if candidate_roles & missing_hard:
+        coverage_bonus = 1.0
+    elif candidate_roles & missing_soft:
+        coverage_bonus = 0.6
+    else:
+        coverage_bonus = 0.0
+
+    diversity_bonus = 0.0
+    if not selected:
+        diversity_bonus = 1.0
+    else:
+        distinct_clip = all(item["clip_id"] != candidate["clip_id"] for item in selected)
+        current_main_tag = candidate_main_tag(semantic_tags)
+        distinct_tag = all(candidate_main_tag(item["semantic_tags"]) != current_main_tag for item in selected)
+        if distinct_clip and distinct_tag:
+            diversity_bonus = 1.0
+        elif distinct_clip or distinct_tag:
+            diversity_bonus = 0.4
+
+    risk_penalty = 0.0
+    high_risk_flags = {
+        "transit-motion-risk",
+        "multi-rally-risk",
+        "rally-start-unresolved",
+        "rally-end-unresolved",
+        "whole-clip-window-risk",
+        "near-black",
+        "soft",
+    }
+    if any(flag in high_risk_flags for flag in candidate["cv_risk_flags"]):
+        risk_penalty += 0.25
+    if float(judgement["confidence"]) < 0.7:
+        risk_penalty += 0.15
+
+    score = (
+        0.35 * model_value_score
+        + 0.25 * in_play_score
+        + 0.15 * completeness_score
+        + 0.15 * coverage_bonus
+        + 0.10 * diversity_bonus
+        - risk_penalty
+    )
+    score += 0.05 * float(candidate.get("cv_pre_score", 0.0))
+    return round(clamp(score, 0.0, 1.0), 3)
+
+
+def clip_overlap_ratio(a: dict[str, Any], b: dict[str, Any]) -> float:
+    if a["clip_id"] != b["clip_id"]:
+        return 0.0
+    a_window = a["candidate_window"]
+    b_window = b["candidate_window"]
+    overlap = overlap_duration(
+        float(a_window["source_clip_offset_start"]),
+        float(a_window["source_clip_offset_end"]),
+        float(b_window["source_clip_offset_start"]),
+        float(b_window["source_clip_offset_end"]),
+    )
+    a_duration = max(0.001, float(a_window["source_clip_offset_end"]) - float(a_window["source_clip_offset_start"]))
+    b_duration = max(0.001, float(b_window["source_clip_offset_end"]) - float(b_window["source_clip_offset_start"]))
+    return overlap / min(a_duration, b_duration)
+
+
+def select_with_coverage(
+    cv_candidate_pool: list[dict[str, Any]],
+    model_judgements: list[dict[str, Any]],
     *,
     selected_size: int,
-    candidate_pool_size: int,
     serve_presence_mode: str,
 ) -> dict[str, Any]:
-    candidate_pool = build_candidate_pool(candidates, candidate_pool_size=candidate_pool_size)
-    selected_target_size = min(selected_size, len(candidate_pool))
-    selected: list[dict[str, Any]] = []
-    selected_ids: set[str] = set()
+    judgement_by_candidate = {item["candidate_id"]: item for item in model_judgements}
+    records: list[dict[str, Any]] = []
     review_queue: list[dict[str, Any]] = []
-    review_ids: set[str] = set()
-    coverage_gap: list[str] = []
     infeasible_reasons: list[str] = []
+    coverage_gap: list[str] = []
 
-    if not candidate_pool:
-        return {
-            "candidate_pool": [],
-            "selected_clips": [],
-            "review_queue": [],
-            "selection_status": "constrained_incomplete",
-            "infeasible_reasons": ["no-usable-candidates"],
-            "coverage_report": {
-                "serve_exists_prob": 0.0,
-                "serve_presence_status": "unknown",
-                "coverage_gap": ["forehand", "backhand", "candidate-pool-empty"],
-                "selected_summary": {
-                    "required_roles": {
-                        "forehand": False,
-                        "backhand": False,
-                        "serve": False,
-                    },
-                    "soft_roles": {
-                        "baseline": False,
-                        "midcourt": False,
-                        "running": False,
-                        "stationary": False,
-                        "left": False,
-                        "center": False,
-                        "right": False,
-                        "highlight": False,
-                        "good-example": False,
-                        "problem-example": False,
-                    },
-                },
-            },
+    for candidate in cv_candidate_pool:
+        judgement = judgement_by_candidate.get(candidate["candidate_id"])
+        if not judgement:
+            continue
+        semantic_tags = derive_semantic_tags(judgement)
+        needs_review = (
+            judgement["in_play"] == "uncertain"
+            or judgement["rally_completeness"] in {"partial_start_missing", "partial_end_missing", "multi_rally", "uncertain"}
+            or float(judgement["confidence"]) < 0.7
+            or bool(judgement["reject_reasons"])
+        )
+        record = {
+            "candidate_id": candidate["candidate_id"],
+            "clip_id": candidate["clip_id"],
+            "source_video_id": candidate["source_video_id"],
+            "source_clip_path": candidate["source_clip_path"],
+            "candidate_window": candidate["candidate_window"],
+            "focus_window": candidate["candidate_window"],
+            "export_window": candidate["export_window_proposal"],
+            "cv_evidence": candidate["cv_evidence"],
+            "cv_risk_flags": candidate["cv_risk_flags"],
+            "model_judgement": judgement,
+            "semantic_tags": semantic_tags,
+            "coverage_roles": coverage_roles_from_semantics(semantic_tags),
+            "selection_reasons": [judgement["selection_reason"], f"candidate_kind:{candidate['candidate_kind']}"],
+            "selection_score": 0.0,
+            "confidence": float(judgement["confidence"]),
+            "needs_review": needs_review,
         }
+        records.append(record)
+        if needs_review:
+            review_queue.append(record)
 
-    serve_exists_prob = max((float(item["semantic_tags"]["serve_prob"]) for item in candidate_pool), default=0.0)
-    serve_presence_status = "likely_absent"
-    must_have_serve = False
+    serve_candidates = [
+        item for item in records if "serve" in item["semantic_tags"]["action_tags"] and item["model_judgement"]["in_play"] != "no"
+    ]
+    serve_likely = any(float(item["confidence"]) >= 0.7 for item in serve_candidates)
     if serve_presence_mode == "present":
         serve_presence_status = "user-confirmed-present"
-        must_have_serve = True
+        require_serve = True
     elif serve_presence_mode == "absent":
         serve_presence_status = "user-confirmed-absent"
-        must_have_serve = False
-    elif serve_exists_prob >= DEFAULTS["serve_exists_threshold"]:
-        serve_presence_status = "likely_present"
-        must_have_serve = True
-    elif serve_exists_prob >= DEFAULTS["serve_uncertain_floor"]:
+        require_serve = False
+    elif serve_likely:
+        serve_presence_status = "model-likely-present"
+        require_serve = True
+    elif serve_candidates:
         serve_presence_status = "uncertain"
-        must_have_serve = True
-    else:
-        coverage_gap.append("serve-presence-likely-absent")
-
-    for role in ("forehand", "backhand"):
-        candidate = best_candidate_for_role(candidate_pool, selected_ids, role)
-        if candidate and float(candidate["semantic_tags"][f"{role}_prob"]) >= DEFAULTS["slot_threshold"]:
-            selected.append(candidate)
-            selected_ids.add(candidate["selection_id"])
-        elif candidate:
-            coverage_gap.append(role)
-            add_to_review_queue(candidate, review_queue, review_ids)
-        else:
-            coverage_gap.append(role)
-
-    if must_have_serve:
-        candidate = best_candidate_for_role(candidate_pool, selected_ids, "serve")
-        if candidate and float(candidate["semantic_tags"]["serve_prob"]) >= DEFAULTS["serve_slot_threshold"]:
-            selected.append(candidate)
-            selected_ids.add(candidate["selection_id"])
-        elif candidate:
-            coverage_gap.append("serve")
-            add_to_review_queue(candidate, review_queue, review_ids)
-        else:
-            coverage_gap.append("serve")
-
-    if serve_presence_status == "uncertain":
+        require_serve = False
         coverage_gap.append("serve-presence-uncertain")
-        serve_review = best_candidate_for_role(candidate_pool, selected_ids, "serve") or best_candidate_for_role(
-            candidate_pool,
-            set(),
-            "serve",
-        )
-        if serve_review:
-            add_to_review_queue(serve_review, review_queue, review_ids)
+    else:
+        serve_presence_status = "model-likely-absent"
+        require_serve = False
 
-    for role in ("highlight", "problem-example"):
-        candidate = best_candidate_for_role(candidate_pool, selected_ids, role, require_in_play=True)
-        if candidate and is_in_play_candidate(candidate):
-            selected.append(candidate)
-            selected_ids.add(candidate["selection_id"])
-        elif candidate:
-            add_to_review_queue(candidate, review_queue, review_ids)
+    hard_roles = {"forehand", "backhand"}
+    if require_serve:
+        hard_roles.add("serve")
+    soft_roles = {"highlight", "problem_example", "good_example", "baseline", "midcourt", "running", "stationary"}
+    selected: list[dict[str, Any]] = []
+    selected_ids: set[str] = set()
 
-    soft_roles: set[str] = set()
-    for candidate in selected:
-        soft_roles.update(role for role in candidate["coverage_roles"] if role not in {"forehand", "backhand", "serve"})
-
-    while len(selected) < selected_target_size:
-        best: dict[str, Any] | None = None
-        best_score = -999.0
-        for candidate in candidate_pool:
-            if candidate["selection_id"] in selected_ids:
+    def pick_best(filter_fn) -> dict[str, Any] | None:
+        best = None
+        best_score = -1.0
+        missing_hard = {role for role in hard_roles if role not in {r for item in selected for r in item["coverage_roles"]}}
+        missing_soft = {role for role in soft_roles if role not in {r for item in selected for r in item["coverage_roles"]}}
+        for item in records:
+            if item["candidate_id"] in selected_ids:
                 continue
-            if not is_in_play_candidate(candidate):
+            if candidate_is_hard_filtered(item["model_judgement"]):
                 continue
-            overlap = overlap_penalty(candidate, selected)
-            semantic_tags = candidate["semantic_tags"]
-            bonus = 0.0
-            court_zone = semantic_tags["court_zone"]["label"]
-            movement_mode = semantic_tags["movement_mode"]["label"]
-            side_zone = semantic_tags["side_zone"]["label"]
-            for role in (court_zone, movement_mode, side_zone):
-                if role not in soft_roles:
-                    bonus += 0.08
-            if semantic_tags["value_roles"]["highlight"] >= 0.58 and "highlight" not in soft_roles:
-                bonus += 0.08
-            if semantic_tags["value_roles"]["problem-example"] >= 0.56 and "problem-example" not in soft_roles:
-                bonus += 0.08
-            if semantic_tags["value_roles"]["good-example"] >= 0.6 and "good-example" not in soft_roles:
-                bonus += 0.08
-            total = float(candidate["selection_score"]) + bonus - 0.35 * overlap
-            if total > best_score:
-                best_score = total
-                best = candidate
-        if not best:
+            if not filter_fn(item):
+                continue
+            score = compute_selection_score(
+                candidate=next(c for c in cv_candidate_pool if c["candidate_id"] == item["candidate_id"]),
+                judgement=item["model_judgement"],
+                selected=selected,
+                missing_hard=missing_hard,
+                missing_soft=missing_soft,
+            )
+            overlap_penalty = max((clip_overlap_ratio(item, prev) for prev in selected), default=0.0)
+            score = score - 0.4 * overlap_penalty
+            if score > best_score:
+                best_score = score
+                best = dict(item)
+                best["selection_score"] = round(clamp(score, 0.0, 1.0), 3)
+        return best
+
+    for role in sorted(hard_roles):
+        chosen = pick_best(lambda item, role=role: role in item["coverage_roles"])
+        if chosen:
+            selected.append(chosen)
+            selected_ids.add(chosen["candidate_id"])
+        else:
+            coverage_gap.append(role)
+            infeasible_reasons.append(f"missing-required-role:{role}")
+
+    for role in ("highlight", "problem_example", "good_example"):
+        if len(selected) >= selected_size:
             break
-        selected.append(best)
-        selected_ids.add(best["selection_id"])
-        soft_roles.update(
-            [
-                best["semantic_tags"]["court_zone"]["label"],
-                best["semantic_tags"]["movement_mode"]["label"],
-                best["semantic_tags"]["side_zone"]["label"],
-            ]
-        )
-        if best["semantic_tags"]["value_roles"]["highlight"] >= 0.58:
-            soft_roles.add("highlight")
-        if best["semantic_tags"]["value_roles"]["problem-example"] >= 0.56:
-            soft_roles.add("problem-example")
-        if best["semantic_tags"]["value_roles"]["good-example"] >= 0.6:
-            soft_roles.add("good-example")
+        chosen = pick_best(lambda item, role=role: role in item["coverage_roles"])
+        if chosen:
+            selected.append(chosen)
+            selected_ids.add(chosen["candidate_id"])
 
-    selected = dedupe_selected_candidates(selected)
-    selected_ids = {item["selection_id"] for item in selected}
-
-    required_roles = ["forehand", "backhand"] + (["serve"] if must_have_serve else [])
-    missing_required: list[str] = [
-        role for role in required_roles if not any(has_role(item, role) for item in selected)
-    ]
-
-    for role in missing_required:
-        refill = best_candidate_for_role(candidate_pool, selected_ids, role)
-        if refill and has_role(refill, role):
-            selected.append(refill)
-            selected_ids.add(refill["selection_id"])
-        elif refill:
-            add_to_review_queue(refill, review_queue, review_ids)
-
-    soft_roles = set()
-    for candidate in selected:
-        soft_roles.update(role for role in candidate["coverage_roles"] if role not in {"forehand", "backhand", "serve"})
-
-    while len(selected) < selected_target_size:
-        best: dict[str, Any] | None = None
-        best_score = -999.0
-        for candidate in candidate_pool:
-            if candidate["selection_id"] in selected_ids:
-                continue
-            if not is_in_play_candidate(candidate):
-                continue
-            overlap = overlap_penalty(candidate, selected)
-            semantic_tags = candidate["semantic_tags"]
-            bonus = 0.0
-            for role in (
-                semantic_tags["court_zone"]["label"],
-                semantic_tags["movement_mode"]["label"],
-                semantic_tags["side_zone"]["label"],
-            ):
-                if role not in soft_roles:
-                    bonus += 0.06
-            if semantic_tags["value_roles"]["highlight"] >= 0.58 and "highlight" not in soft_roles:
-                bonus += 0.06
-            if semantic_tags["value_roles"]["problem-example"] >= 0.56 and "problem-example" not in soft_roles:
-                bonus += 0.06
-            if semantic_tags["value_roles"]["good-example"] >= 0.6 and "good-example" not in soft_roles:
-                bonus += 0.04
-            total = float(candidate["selection_score"]) + bonus - 0.45 * overlap
-            if total > best_score:
-                best_score = total
-                best = candidate
-        if not best:
+    while len(selected) < selected_size:
+        chosen = pick_best(lambda item: True)
+        if not chosen:
             break
-        selected.append(best)
-        selected_ids.add(best["selection_id"])
-        soft_roles.update(role for role in best["coverage_roles"] if role not in {"forehand", "backhand", "serve"})
+        selected.append(chosen)
+        selected_ids.add(chosen["candidate_id"])
 
-    selected = sorted(selected, key=lambda item: float(item["selection_score"]), reverse=True)[:selected_target_size]
-    selected_ids = {item["selection_id"] for item in selected}
-
-    missing_required = [
-        role for role in required_roles if not any(has_role(item, role) for item in selected)
-    ]
-    coverage_gap.extend(missing_required)
-    for role in missing_required:
-        infeasible_reasons.append(f"missing-required-role:{role}")
-
-    if selected_target_size < selected_size:
-        infeasible_reasons.append("insufficient-candidate-pool-for-target-size")
-
-    if len(selected) < selected_target_size:
+    selected_deduped: list[dict[str, Any]] = []
+    for item in sorted(selected, key=lambda row: float(row["selection_score"]), reverse=True):
+        if any(clip_overlap_ratio(item, prev) >= 0.72 for prev in selected_deduped):
+            continue
+        selected_deduped.append(item)
+    selected = selected_deduped[:selected_size]
+    if len(selected) < min(selected_size, len(records)):
         infeasible_reasons.append("unable-to-fill-selected-size-after-constraints")
 
-    clip_counts: dict[str, int] = {}
-    for candidate in candidate_pool:
-        clip_counts[candidate["clip_id"]] = clip_counts.get(candidate["clip_id"], 0) + 1
-    dominant_from_few = False
-    if len(candidate_pool) >= max(4, int(0.75 * candidate_pool_size)) and clip_counts:
-        top_two = sorted(clip_counts.values(), reverse=True)[:2]
-        dominant_from_few = sum(top_two) / len(candidate_pool) >= 0.7
-    if dominant_from_few:
-        coverage_gap.append("high-repetition-risk")
-        ranked = sorted(candidate_pool, key=lambda item: float(item["selection_score"]), reverse=True)
-        for candidate in ranked[:3]:
-            add_to_review_queue(candidate, review_queue, review_ids)
+    required_roles_covered = {role: any(role in item["coverage_roles"] for item in selected) for role in ("forehand", "backhand", "serve")}
+    missing_hard_roles = [role for role, covered in required_roles_covered.items() if role in hard_roles and not covered]
+    coverage_gap.extend(missing_hard_roles)
+    if missing_hard_roles:
+        infeasible_reasons.extend([f"missing-required-role:{role}" for role in missing_hard_roles])
 
-    for candidate in candidate_pool:
-        if candidate["needs_review"] and candidate["selection_id"] not in review_ids:
-            add_to_review_queue(candidate, review_queue, review_ids)
-        if len(review_queue) >= 6:
+    selection_status = "ready"
+    if missing_hard_roles or len(selected) < max(1, min(selected_size, len(records))):
+        selection_status = "constrained_incomplete"
+
+    selected_with_ids: list[dict[str, Any]] = []
+    for index, item in enumerate(selected, start=1):
+        row = dict(item)
+        row["selection_id"] = f"selection-{index:02d}-{row['candidate_id']}"
+        row["selected_clip_window"] = row["export_window"]
+        selected_with_ids.append(row)
+
+    review_rows: list[dict[str, Any]] = []
+    for row in review_queue:
+        if row["candidate_id"] in {item["candidate_id"] for item in selected_with_ids}:
+            continue
+        review_rows.append(row)
+        if len(review_rows) >= 6:
             break
 
     selected_summary = {
-        "required_roles": {
-            "forehand": any(has_role(item, "forehand") for item in selected),
-            "backhand": any(has_role(item, "backhand") for item in selected),
-            "serve": any(has_role(item, "serve") for item in selected),
-        },
-        "soft_roles": {
-            "baseline": any(item["semantic_tags"]["court_zone"]["label"] == "baseline" for item in selected),
-            "midcourt": any(item["semantic_tags"]["court_zone"]["label"] == "midcourt" for item in selected),
-            "running": any(item["semantic_tags"]["movement_mode"]["label"] == "running" for item in selected),
-            "stationary": any(item["semantic_tags"]["movement_mode"]["label"] == "stationary" for item in selected),
-            "left": any(item["semantic_tags"]["side_zone"]["label"] == "left" for item in selected),
-            "center": any(item["semantic_tags"]["side_zone"]["label"] == "center" for item in selected),
-            "right": any(item["semantic_tags"]["side_zone"]["label"] == "right" for item in selected),
-            "highlight": any(item["semantic_tags"]["value_roles"]["highlight"] >= 0.58 for item in selected),
-            "good-example": any(item["semantic_tags"]["value_roles"]["good-example"] >= 0.6 for item in selected),
-            "problem-example": any(item["semantic_tags"]["value_roles"]["problem-example"] >= 0.56 for item in selected),
-        },
+        "required_roles": required_roles_covered,
+        "soft_roles": {role: any(role in item["coverage_roles"] for item in selected_with_ids) for role in soft_roles},
+        "selected_count": len(selected_with_ids),
     }
-    selection_status = "ready" if not missing_required and len(selected) >= selected_target_size else "constrained_incomplete"
-
+    coverage_report = {
+        "required_roles": {"forehand": True, "backhand": True, "serve": require_serve},
+        "soft_roles": sorted(soft_roles),
+        "coverage_gap": sorted(set(coverage_gap)),
+        "serve_presence_status": serve_presence_status,
+        "selected_summary": selected_summary,
+    }
     return {
-        "candidate_pool": candidate_pool,
-        "selected_clips": selected,
-        "review_queue": review_queue[:6],
+        "selected_clips": selected_with_ids,
+        "review_queue": review_rows,
         "selection_status": selection_status,
+        "coverage_report": coverage_report,
         "infeasible_reasons": sorted(set(infeasible_reasons)),
-        "coverage_report": {
-            "serve_exists_prob": round(serve_exists_prob, 3),
-            "serve_presence_status": serve_presence_status,
-            "coverage_gap": sorted(set(coverage_gap)),
-            "selected_summary": selected_summary,
-        },
     }
 
 
-def clip_summary_for_notes(candidates: list[dict[str, Any]]) -> dict[str, Any]:
-    if not candidates:
-        return {
-            "candidate_count": 0,
-            "avg_selection_score": 0.0,
-            "avg_dead_time_ratio": 0.0,
-        }
-    return {
-        "candidate_count": len(candidates),
-        "avg_selection_score": round(safe_mean(item["selection_score"] for item in candidates), 3),
-        "avg_dead_time_ratio": round(
-            safe_mean(item["window_metrics"]["dead_time_ratio"] for item in candidates),
-            3,
-        ),
-    }
-
-
-def export_selected_focus_clips(
+def export_selected_clips(
     selected: list[dict[str, Any]],
     export_dir: pathlib.Path,
 ) -> list[dict[str, Any]]:
@@ -1881,50 +2392,23 @@ def export_selected_focus_clips(
     for index, candidate in enumerate(selected, start=1):
         source_path = pathlib.Path(candidate["source_clip_path"])
         if not source_path.exists():
-            raise RuntimeError(f"missing source clip for export: {source_path}")
-        selected_window = candidate_overlap_window(candidate)
-        start_offset = float(selected_window["source_clip_offset_start"])
-        end_offset = float(selected_window["source_clip_offset_end"])
-        duration = max(0.001, end_offset - start_offset)
-        export_name = f"{index:02d}-{candidate['selection_id']}.mp4"
-        export_path = export_dir / export_name
-        run_command(
-            [
-                "ffmpeg",
-                "-y",
-                "-v",
-                "error",
-                "-hide_banner",
-                "-ss",
-                f"{start_offset:.3f}",
-                "-i",
-                str(source_path),
-                "-t",
-                f"{duration:.3f}",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "fast",
-                "-crf",
-                "18",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "128k",
-                str(export_path),
-            ]
-        )
-        candidate["exported_focus_clip_path"] = str(export_path)
+            continue
+        export_path = export_dir / f"{index:02d}-{candidate['selection_id']}.mp4"
+        export_window_video(source_clip_path=source_path, window=candidate["export_window"], output_path=export_path)
+        candidate["exported_clip_path"] = str(export_path)
         exports.append(
             {
                 "selection_id": candidate["selection_id"],
+                "candidate_id": candidate["candidate_id"],
                 "export_path": str(export_path),
                 "source_clip_path": str(source_path),
-                "window_kind": candidate.get("window_kind"),
-                "export_window_kind": "selected_clip_window" if "selected_clip_window" in candidate else "focus_window",
-                "start_offset": round(start_offset, 3),
-                "end_offset": round(end_offset, 3),
-                "duration": round(duration, 3),
+                "start_offset": candidate["export_window"]["source_clip_offset_start"],
+                "end_offset": candidate["export_window"]["source_clip_offset_end"],
+                "duration": round(
+                    float(candidate["export_window"]["source_clip_offset_end"])
+                    - float(candidate["export_window"]["source_clip_offset_start"]),
+                    3,
+                ),
             }
         )
     return exports
@@ -1932,6 +2416,7 @@ def export_selected_focus_clips(
 
 def main() -> None:
     args = parse_args()
+    apply_config_defaults(args)
     run_dir = resolve_run_dir(args.run_dir)
     manifest_path = run_dir / "manifest.json"
     point_dir = run_dir / "point_clips"
@@ -1940,7 +2425,8 @@ def main() -> None:
     if not point_dir.exists():
         raise SystemExit(f"Missing point_clips/ under {run_dir}")
 
-    manifest = json.loads(manifest_path.read_text())
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    point_clips = [clip for clip in manifest.get("point_clips", []) if pathlib.Path(clip.get("export_path", "")).exists()]
     selection_run_id = args.selection_run_id or time.strftime("%Y%m%d-%H%M%S")
     output_dir = pathlib.Path(args.output_dir).resolve() if args.output_dir else run_dir / "selection_runs" / selection_run_id
     selected_clips_dir = (
@@ -1949,71 +2435,127 @@ def main() -> None:
         else run_dir / "selected_clips" / selection_run_id
     )
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    clip_candidates: list[dict[str, Any]] = []
-    clip_debug: list[dict[str, Any]] = []
     started_at = time.time()
 
+    if not point_clips:
+        package = {
+            "selection_version": "v1.0.1-implementation-ready-local-vlm-rerank",
+            "source_segmentation_run": {
+                "run_dir": str(run_dir),
+                "manifest_path": str(manifest_path),
+                "input": manifest.get("input"),
+                "source_video_id": None,
+                "point_clip_count": 0,
+            },
+            "selection_run_id": selection_run_id,
+            "params": {"candidate_pool_size": args.candidate_pool_size, "selected_size": args.selected_size},
+            "cv_candidate_pool": [],
+            "candidate_pool": [],
+            "model_input_packages": [],
+            "model_judgements": [],
+            "selected_clips": [],
+            "coverage_report": {
+                "required_roles": {"forehand": True, "backhand": True, "serve": False},
+                "soft_roles": [],
+                "coverage_gap": ["empty-point-clips"],
+                "serve_presence_status": "uncertain",
+                "selected_summary": {"required_roles": {}, "soft_roles": {}, "selected_count": 0},
+            },
+            "review_queue": [],
+            "selection_status": "no_candidates",
+            "infeasible_reasons": ["empty-point-clips"],
+            "selected_clip_exports_dir": None,
+            "selected_clip_exports": [],
+            "selection_notes": {},
+        }
+        output_path = output_dir / "selection-package.json"
+        output_path.write_text(json.dumps(to_jsonable(package), ensure_ascii=False, indent=2), encoding="utf-8")
+        print(str(output_path))
+        return
+
+    raw_candidates: list[dict[str, Any]] = []
+    clip_debug: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="selection-") as temp_root:
         temp_root_path = pathlib.Path(temp_root)
-        for clip in manifest.get("point_clips", []):
+        for clip in point_clips:
             video_path = pathlib.Path(clip["export_path"])
-            if not video_path.exists():
-                continue
             probe = ffprobe_json(video_path)
-            motion_analysis = extract_motion_features(
-                video_path,
-                temp_root_path,
-                fps=args.analysis_fps,
-                scale=args.analysis_scale,
-            )
-            candidates = generate_candidates_for_clip(
-                clip,
-                motion_analysis,
-                handedness=args.handedness,
-            )
-            for candidate in candidates:
-                streams = probe.get("streams", [])
-                video_stream = next((stream for stream in streams if stream.get("codec_type") == "video"), {})
+            motion_analysis = extract_motion_features(video_path, temp_root_path, fps=args.analysis_fps, scale=args.analysis_scale)
+            generated = generate_candidates_for_clip(clip, motion_analysis, handedness=args.handedness)
+            streams = probe.get("streams", [])
+            video_stream = next((stream for stream in streams if stream.get("codec_type") == "video"), {})
+            for candidate in generated:
                 candidate["source_clip_probe"] = {
                     "codec_name": video_stream.get("codec_name"),
                     "width": video_stream.get("width"),
                     "height": video_stream.get("height"),
                     "bit_rate": video_stream.get("bit_rate") or probe.get("format", {}).get("bit_rate"),
                 }
-            clip_candidates.extend(candidates)
+            raw_candidates.extend(generated)
             clip_debug.append(
                 {
                     "clip_id": clip["clip_id"],
                     "clip_duration": clip["duration"],
                     "source_interval_count": len(relative_source_intervals(clip)),
                     "motion_window_count": len(motion_analysis["windows"]),
-                    "generated_candidates": clip_summary_for_notes(candidates),
+                    "generated_candidates": len(generated),
                     "quality": motion_analysis["quality"],
                 }
             )
 
-    selection_result = select_final_candidates(
-        clip_candidates,
-        selected_size=args.selected_size,
-        candidate_pool_size=args.candidate_pool_size,
-        serve_presence_mode=args.serve_presence,
+    cv_candidate_pool = build_cv_candidate_pool(raw_candidates, candidate_pool_size=max(12, min(24, args.candidate_pool_size)))
+    model_input_packages = build_model_input_packages(
+        cv_candidate_pool,
+        output_dir,
+        frames_per_candidate=max(6, min(12, args.frames_per_candidate)),
     )
+
+    model_judgements, model_any_success, used_fallback, model_error = run_model_judgements(
+        model_input_packages,
+        endpoint=str(args.local_vlm_endpoint),
+        primary_model=str(args.local_vlm_model),
+        fallback_model=str(args.local_vlm_fallback_model),
+        timeout_seconds=int(args.local_vlm_timeout_seconds),
+        max_retries=int(args.local_vlm_max_retries),
+        temperature=float(args.local_vlm_temperature),
+    )
+
     selected_clip_exports: list[dict[str, Any]] = []
-    if not args.skip_export_clips and selection_result["selected_clips"]:
-        selected_clip_exports = export_selected_focus_clips(
-            selection_result["selected_clips"],
-            selected_clips_dir,
+    if not model_any_success and model_error:
+        selection_result = {
+            "selected_clips": [],
+            "review_queue": [],
+            "coverage_report": {
+                "required_roles": {"forehand": True, "backhand": True, "serve": False},
+                "soft_roles": [],
+                "coverage_gap": ["model-unavailable"],
+                "serve_presence_status": "uncertain",
+                "selected_summary": {"required_roles": {}, "soft_roles": {}, "selected_count": 0},
+            },
+            "selection_status": "model_unavailable",
+            "infeasible_reasons": ["model-unavailable", model_error[:160]],
+        }
+    else:
+        selection_result = select_with_coverage(
+            cv_candidate_pool,
+            model_judgements,
+            selected_size=int(args.selected_size),
+            serve_presence_mode=str(args.serve_presence),
         )
+        if used_fallback and selection_result["selection_status"] == "ready":
+            selection_result["selection_status"] = "model_degraded"
+        if not args.skip_export_clips and selection_result["selected_clips"]:
+            selected_clip_exports = export_selected_clips(selection_result["selected_clips"], selected_clips_dir)
+
     finished_at = time.time()
     package = {
-        "selection_version": "05-v1-local-opencv-enhanced" if cv2 is not None else "05-v1-local-rule-based",
+        "selection_version": "v1.0.1-implementation-ready-local-vlm-rerank",
         "source_segmentation_run": {
             "run_dir": str(run_dir),
             "manifest_path": str(manifest_path),
             "input": manifest.get("input"),
-            "source_video_id": manifest.get("point_clips", [{}])[0].get("source_video_id"),
-            "point_clip_count": manifest.get("counts", {}).get("point_clips"),
+            "source_video_id": point_clips[0].get("source_video_id") if point_clips else None,
+            "point_clip_count": len(point_clips),
         },
         "selection_run_id": selection_run_id,
         "params": {
@@ -2021,16 +2563,27 @@ def main() -> None:
             "analysis_scale": args.analysis_scale,
             "candidate_pool_size": args.candidate_pool_size,
             "selected_size": args.selected_size,
+            "frames_per_candidate": args.frames_per_candidate,
             "handedness": args.handedness,
             "serve_presence": args.serve_presence,
-            "ollama_model": args.ollama_model,
-            "ollama_mode": "not-implemented-yet" if args.ollama_model else "disabled",
+            "local_vlm": {
+                "provider": args.local_vlm_provider,
+                "endpoint": args.local_vlm_endpoint,
+                "model": args.local_vlm_model,
+                "fallback_model": args.local_vlm_fallback_model,
+                "timeout_seconds": args.local_vlm_timeout_seconds,
+                "max_retries": args.local_vlm_max_retries,
+                "temperature": args.local_vlm_temperature,
+            },
             "motion_backend": "opencv" if cv2 is not None else "numpy",
         },
-        "candidate_pool": selection_result["candidate_pool"],
+        "cv_candidate_pool": cv_candidate_pool,
+        "candidate_pool": cv_candidate_pool,
+        "model_input_packages": model_input_packages,
+        "model_judgements": model_judgements,
         "selected_clips": selection_result["selected_clips"],
         "coverage_report": selection_result["coverage_report"],
-        "review_queue": selection_result["review_queue"],
+        "review_queue": selection_result["review_queue"][:6],
         "selection_status": selection_result["selection_status"],
         "infeasible_reasons": selection_result["infeasible_reasons"],
         "selected_clip_exports_dir": str(selected_clips_dir) if selected_clip_exports else None,
@@ -2039,19 +2592,22 @@ def main() -> None:
             "started_at_epoch": round(started_at, 3),
             "finished_at_epoch": round(finished_at, 3),
             "elapsed_seconds": round(finished_at - started_at, 3),
-            "candidate_count": len(clip_candidates),
+            "raw_candidate_count": len(raw_candidates),
+            "cv_candidate_pool_count": len(cv_candidate_pool),
+            "model_judgement_count": len(model_judgements),
             "clip_debug_summary": clip_debug,
         },
     }
+
     output_path = output_dir / "selection-package.json"
-    output_path.write_text(json.dumps(to_jsonable(package), ensure_ascii=False, indent=2))
+    output_path.write_text(json.dumps(to_jsonable(package), ensure_ascii=False, indent=2), encoding="utf-8")
     print(str(output_path))
     print(
         json.dumps(
             {
                 "selection_run_id": selection_run_id,
-                "candidate_count": len(clip_candidates),
-                "candidate_pool_count": len(package["candidate_pool"]),
+                "raw_candidate_count": len(raw_candidates),
+                "cv_candidate_pool_count": len(cv_candidate_pool),
                 "selected_count": len(package["selected_clips"]),
                 "selection_status": package["selection_status"],
                 "coverage_gap": package["coverage_report"]["coverage_gap"],

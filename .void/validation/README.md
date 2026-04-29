@@ -52,6 +52,9 @@
 - `v1.0.0` 重设计验证：[2026-04-28-video-selection-v1.0.0-redesign](./2026-04-28-video-selection-v1.0.0-redesign.md)
 - `v1.0.1` 实现规格补强验证：[2026-04-28-video-selection-v1.0.1-implementation-spec](./2026-04-28-video-selection-v1.0.1-implementation-spec.md)
 
+v1.0.1 运行期错误复核：
+- `img_3026` 非回合误选复核：[2026-04-29-video-selection-img3026-non-rally-false-positive](./2026-04-29-video-selection-img3026-non-rally-false-positive.md)
+
 ## 与 Void v0.2.2 的迁移约定
 - 现有验证文档保持原文件名与原链接，不做追溯性批量重命名。
 - 从下一轮正式修改某个 `solution/current.md` 开始，先归档当前版本，再补对应版本的 `validation`。
