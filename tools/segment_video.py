@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import audioop
 import json
 import math
 import os
@@ -17,6 +16,11 @@ import wave
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+try:
+    import audioop  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - Python 3.13+
+    audioop = None  # type: ignore
 
 
 @dataclass
@@ -245,6 +249,38 @@ def dbfs_from_rms(rms: int) -> float:
     return 20.0 * math.log10(rms / 32768.0)
 
 
+def _tomono_pcm_s16le(chunk: bytes, channels: int) -> bytes:
+    if channels <= 1:
+        return chunk
+    if len(chunk) % (2 * channels) != 0:
+        return chunk
+    out = bytearray()
+    for offset in range(0, len(chunk), 2 * channels):
+        total = 0
+        for channel in range(channels):
+            start = offset + channel * 2
+            sample = int.from_bytes(chunk[start : start + 2], byteorder="little", signed=True)
+            total += sample
+        avg = int(total / channels)
+        if avg > 32767:
+            avg = 32767
+        elif avg < -32768:
+            avg = -32768
+        out.extend(int(avg).to_bytes(2, byteorder="little", signed=True))
+    return bytes(out)
+
+
+def _rms_pcm_s16le(chunk: bytes) -> int:
+    if not chunk or len(chunk) % 2 != 0:
+        return 0
+    sample_count = len(chunk) // 2
+    total_square = 0.0
+    for offset in range(0, len(chunk), 2):
+        sample = int.from_bytes(chunk[offset : offset + 2], byteorder="little", signed=True)
+        total_square += float(sample * sample)
+    return int(math.sqrt(total_square / sample_count))
+
+
 def extract_level_windows(wav_path: Path, window_seconds: float) -> List[Tuple[float, float]]:
     with wave.open(str(wav_path), "rb") as wav:
         frame_rate = wav.getframerate()
@@ -258,8 +294,16 @@ def extract_level_windows(wav_path: Path, window_seconds: float) -> List[Tuple[f
             if not chunk:
                 break
             if channels > 1:
-                chunk = audioop.tomono(chunk, sample_width, 0.5, 0.5)
-            rms = audioop.rms(chunk, sample_width)
+                if audioop is not None:
+                    chunk = audioop.tomono(chunk, sample_width, 0.5, 0.5)
+                elif sample_width == 2:
+                    chunk = _tomono_pcm_s16le(chunk, channels)
+            if audioop is not None:
+                rms = audioop.rms(chunk, sample_width)
+            elif sample_width == 2:
+                rms = _rms_pcm_s16le(chunk)
+            else:
+                raise RuntimeError("audioop is unavailable and fallback currently supports only PCM s16le audio.")
             windows.append((index * window_seconds, dbfs_from_rms(rms)))
             index += 1
         return windows
