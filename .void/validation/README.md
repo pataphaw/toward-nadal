@@ -24,12 +24,13 @@
 - `video-segmentation-v1`
 - `video-selection`
 
-视频切片当前有 `5` 份验证，覆盖五类证据：
+视频切片当前有 `6` 份验证，覆盖六类证据：
 - 首轮落地基线：[2026-04-20-video-segmentation-v1-bootstrap](./2026-04-20-video-segmentation-v1-bootstrap.md)
 - 导出重跑与资源基线：[2026-04-21-video-segmentation-replay-benchmark](./2026-04-21-video-segmentation-replay-benchmark.md)
 - 边界重推基线：[2026-04-22-video-segmentation-boundary-rederive](./2026-04-22-video-segmentation-boundary-rederive.md)
 - 误拆修复验证：[2026-04-22-video-segmentation-motion-priority-fix](./2026-04-22-video-segmentation-motion-priority-fix.md)
 - 真实使用抽样复核：[2026-04-24-img3076-segmentation-sampling](./2026-04-24-img3076-segmentation-sampling.md)
+- `img_3132` 回合边界硬约束修复：[2026-04-30-img3132-rally-boundary-hard-constraint](./2026-04-30-img3132-rally-boundary-hard-constraint.md)
 
 视频精选当前验证记录按主题分为：
 - 旧 CV-heavy 主线的连续反馈链
@@ -69,12 +70,14 @@ v1.0.1 运行期错误复核：
 3. [2026-04-22-video-segmentation-boundary-rederive](./2026-04-22-video-segmentation-boundary-rederive.md)
 4. [2026-04-22-video-segmentation-motion-priority-fix](./2026-04-22-video-segmentation-motion-priority-fix.md)
 5. [2026-04-24-img3076-segmentation-sampling](./2026-04-24-img3076-segmentation-sampling.md)
+6. [2026-04-30-img3132-rally-boundary-hard-constraint](./2026-04-30-img3132-rally-boundary-hard-constraint.md)
 
 如果要快速定位“当前方案是否暂时可用”，建议优先阅读：
 
 1. [视频切片 V1 验证索引](./video-segmentation-v1-validation-index.md)
 2. [2026-04-22-video-segmentation-motion-priority-fix](./2026-04-22-video-segmentation-motion-priority-fix.md)
 3. [2026-04-24-img3076-segmentation-sampling](./2026-04-24-img3076-segmentation-sampling.md)
+4. [2026-04-30-img3132-rally-boundary-hard-constraint](./2026-04-30-img3132-rally-boundary-hard-constraint.md)
 
 ## 当前整理约定
 这次整理后，单份验证文档尽量保持以下骨架：
