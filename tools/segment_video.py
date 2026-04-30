@@ -625,8 +625,6 @@ def split_point_clips_on_motion_gaps(
     point_clips: Sequence[Clip],
     motion_clusters: Sequence[Interval],
     split_gap_seconds: float,
-    tail_trim_gap_seconds: float,
-    tail_cluster_max_seconds: float,
     buffer_seconds: float,
     min_point_duration: float,
 ) -> List[Clip]:
@@ -747,7 +745,6 @@ def enrich_boundary_evidence(
     point_clips: Sequence[Clip],
     *,
     min_point_duration: float,
-    short_clip_reject_seconds: float,
 ) -> List[Clip]:
     enriched: List[Clip] = []
     for clip in point_clips:
@@ -768,8 +765,10 @@ def enrich_boundary_evidence(
             uncertain_reasons.append("missing_end_anchor")
         if candidate.duration < min_point_duration:
             uncertain_reasons.append("below_min_point_duration")
-        if candidate.duration < short_clip_reject_seconds:
-            uncertain_reasons.append("too_short_for_full_rally")
+        quality_flags: List[str] = list(evidence.get("quality_flags", []))
+        if candidate.duration < max(10.0, min_point_duration * 1.5):
+            quality_flags.append("short_rally_clip")
+        evidence["quality_flags"] = sorted(set(quality_flags))
         if uncertain_reasons:
             evidence["boundary_status"] = "uncertain"
             evidence["uncertain_reason"] = uncertain_reasons
@@ -790,6 +789,14 @@ def manifest_path_for(run_dir: Path) -> Path:
 
 def main() -> int:
     args = parse_args()
+    if (
+        args.motion_tail_trim_gap_seconds != DEFAULTS["motion_tail_trim_gap_seconds"]
+        or args.motion_tail_cluster_max_seconds != DEFAULTS["motion_tail_cluster_max_seconds"]
+    ):
+        print(
+            "warning: --motion-tail-trim-gap-seconds and --motion-tail-cluster-max-seconds are ignored in current segment logic.",
+            file=sys.stderr,
+        )
     input_path = Path(args.input).expanduser().resolve()
     if not input_path.exists():
         raise SystemExit(f"Input video not found: {input_path}")
@@ -882,15 +889,12 @@ def main() -> int:
         point_clips,
         motion_clusters=motion_clusters,
         split_gap_seconds=args.motion_split_gap_seconds,
-        tail_trim_gap_seconds=args.motion_tail_trim_gap_seconds,
-        tail_cluster_max_seconds=args.motion_tail_cluster_max_seconds,
         buffer_seconds=args.motion_buffer_seconds,
         min_point_duration=args.min_point_duration,
     )
     point_clips = enrich_boundary_evidence(
         point_clips,
         min_point_duration=args.min_point_duration,
-        short_clip_reject_seconds=max(10.0, args.min_point_duration * 1.5),
     )
     compact_clips: List[Clip] = []
     if not args.skip_compact:
@@ -939,6 +943,7 @@ def main() -> int:
             "motion_split_gap_seconds": args.motion_split_gap_seconds,
             "motion_tail_trim_gap_seconds": args.motion_tail_trim_gap_seconds,
             "motion_tail_cluster_max_seconds": args.motion_tail_cluster_max_seconds,
+            "motion_tail_trim_policy": "ignored_in_v1_1",
             "motion_buffer_seconds": args.motion_buffer_seconds,
             "video_encoder": args.video_encoder,
             "skip_compact": args.skip_compact,
