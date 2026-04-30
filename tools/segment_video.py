@@ -625,8 +625,6 @@ def split_point_clips_on_motion_gaps(
     point_clips: Sequence[Clip],
     motion_clusters: Sequence[Interval],
     split_gap_seconds: float,
-    tail_trim_gap_seconds: float,
-    tail_cluster_max_seconds: float,
     buffer_seconds: float,
     min_point_duration: float,
 ) -> List[Clip]:
@@ -658,20 +656,8 @@ def split_point_clips_on_motion_gaps(
                 current_start = max(clip.start_time, right.start - buffer_seconds)
             current_cluster_index += 1
 
+        # Keep the original clip end to avoid trimming an in-progress rally tail.
         final_end = clip.end_time
-        final_clusters = [cluster for cluster in clusters if cluster.end >= current_start]
-        if len(final_clusters) >= 2:
-            prev_cluster = final_clusters[-2]
-            last_cluster = final_clusters[-1]
-            trailing_gap = last_cluster.start - prev_cluster.end
-            trailing_cluster_duration = last_cluster.duration
-            tail_room = clip.end_time - last_cluster.start
-            if (
-                trailing_gap >= tail_trim_gap_seconds
-                and trailing_cluster_duration <= tail_cluster_max_seconds
-                and tail_room <= tail_cluster_max_seconds + buffer_seconds
-            ):
-                final_end = min(final_end, prev_cluster.end + buffer_seconds)
 
         if final_end - current_start >= min_point_duration:
             segment_ranges.append((current_start, final_end))
@@ -755,12 +741,62 @@ def serialise_clips(clips: Sequence[Clip]) -> List[Dict[str, object]]:
     return [asdict(clip) for clip in clips]
 
 
+def enrich_boundary_evidence(
+    point_clips: Sequence[Clip],
+    *,
+    min_point_duration: float,
+) -> List[Clip]:
+    enriched: List[Clip] = []
+    for clip in point_clips:
+        candidate = clip_copy(clip)
+        evidence = dict(candidate.boundary_evidence or {})
+        start_support = evidence.get("supporting_silence_before")
+        end_support = evidence.get("supporting_silence_after")
+        has_start_anchor = start_support is not None
+        has_end_anchor = end_support is not None
+        evidence["start_anchor"] = "silence_before" if has_start_anchor else "unresolved"
+        evidence["end_anchor"] = "silence_after" if has_end_anchor else "unresolved"
+        evidence["source_signals"] = ["audio_silence", "audio_rms", "motion_activity"]
+        evidence["trim_actions"] = evidence.get("trim_actions", [])
+        uncertain_reasons: List[str] = []
+        if not has_start_anchor:
+            uncertain_reasons.append("missing_start_anchor")
+        if not has_end_anchor:
+            uncertain_reasons.append("missing_end_anchor")
+        if candidate.duration < min_point_duration:
+            uncertain_reasons.append("below_min_point_duration")
+        quality_flags: List[str] = list(evidence.get("quality_flags", []))
+        if candidate.duration < max(10.0, min_point_duration * 1.5):
+            quality_flags.append("short_rally_clip")
+        evidence["quality_flags"] = sorted(set(quality_flags))
+        if uncertain_reasons:
+            evidence["boundary_status"] = "uncertain"
+            evidence["uncertain_reason"] = uncertain_reasons
+            evidence["anchor_confidence"] = 0.0
+            candidate.confidence = round(min(candidate.confidence, 0.35), 2)
+        else:
+            evidence["boundary_status"] = "confirmed"
+            evidence["uncertain_reason"] = []
+            evidence["anchor_confidence"] = 0.9
+        candidate.boundary_evidence = evidence
+        enriched.append(candidate)
+    return enriched
+
+
 def manifest_path_for(run_dir: Path) -> Path:
     return run_dir / "manifest.json"
 
 
 def main() -> int:
     args = parse_args()
+    if (
+        args.motion_tail_trim_gap_seconds != DEFAULTS["motion_tail_trim_gap_seconds"]
+        or args.motion_tail_cluster_max_seconds != DEFAULTS["motion_tail_cluster_max_seconds"]
+    ):
+        print(
+            "warning: --motion-tail-trim-gap-seconds and --motion-tail-cluster-max-seconds are ignored in current segment logic.",
+            file=sys.stderr,
+        )
     input_path = Path(args.input).expanduser().resolve()
     if not input_path.exists():
         raise SystemExit(f"Input video not found: {input_path}")
@@ -853,9 +889,11 @@ def main() -> int:
         point_clips,
         motion_clusters=motion_clusters,
         split_gap_seconds=args.motion_split_gap_seconds,
-        tail_trim_gap_seconds=args.motion_tail_trim_gap_seconds,
-        tail_cluster_max_seconds=args.motion_tail_cluster_max_seconds,
         buffer_seconds=args.motion_buffer_seconds,
+        min_point_duration=args.min_point_duration,
+    )
+    point_clips = enrich_boundary_evidence(
+        point_clips,
         min_point_duration=args.min_point_duration,
     )
     compact_clips: List[Clip] = []
@@ -905,6 +943,7 @@ def main() -> int:
             "motion_split_gap_seconds": args.motion_split_gap_seconds,
             "motion_tail_trim_gap_seconds": args.motion_tail_trim_gap_seconds,
             "motion_tail_cluster_max_seconds": args.motion_tail_cluster_max_seconds,
+            "motion_tail_trim_policy": "ignored_in_v1_1",
             "motion_buffer_seconds": args.motion_buffer_seconds,
             "video_encoder": args.video_encoder,
             "skip_compact": args.skip_compact,

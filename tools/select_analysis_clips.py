@@ -2427,6 +2427,11 @@ def main() -> None:
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     point_clips = [clip for clip in manifest.get("point_clips", []) if pathlib.Path(clip.get("export_path", "")).exists()]
+    point_clips = [
+        clip
+        for clip in point_clips
+        if clip.get("boundary_evidence", {}).get("boundary_status", "confirmed") == "confirmed"
+    ]
     selection_run_id = args.selection_run_id or time.strftime("%Y%m%d-%H%M%S")
     output_dir = pathlib.Path(args.output_dir).resolve() if args.output_dir else run_dir / "selection_runs" / selection_run_id
     selected_clips_dir = (
