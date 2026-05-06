@@ -58,9 +58,6 @@ DEFAULTS = {
     "post_roll_seconds": 1.5,
     "min_point_duration": 5.0,
     "max_point_duration": 35.0,
-    "compact_gap_seconds": 8.0,
-    "compact_max_duration": 75.0,
-    "compact_max_points": 3,
     "min_silence_duration": 1.2,
     "fragment_gap_seconds": 12.0,
     "fragment_short_point_seconds": 14.0,
@@ -85,7 +82,7 @@ def run(cmd: Sequence[str], *, capture_output: bool = False, check: bool = True)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Segment a long-form tennis video into point and compact clips.")
+    parser = argparse.ArgumentParser(description="Segment a long-form tennis video into point clips.")
     parser.add_argument("--input", required=True, help="Absolute path to the source video.")
     parser.add_argument("--config", default="config.toml", help="Optional local config file.")
     parser.add_argument("--raw-dir", help="Directory used to store a backed-up copy of the source video.")
@@ -99,9 +96,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--post-roll-seconds", type=float, default=DEFAULTS["post_roll_seconds"])
     parser.add_argument("--min-point-duration", type=float, default=DEFAULTS["min_point_duration"])
     parser.add_argument("--max-point-duration", type=float, default=DEFAULTS["max_point_duration"])
-    parser.add_argument("--compact-gap-seconds", type=float, default=DEFAULTS["compact_gap_seconds"])
-    parser.add_argument("--compact-max-duration", type=float, default=DEFAULTS["compact_max_duration"])
-    parser.add_argument("--compact-max-points", type=int, default=DEFAULTS["compact_max_points"])
     parser.add_argument("--min-silence-duration", type=float, default=DEFAULTS["min_silence_duration"])
     parser.add_argument("--fragment-gap-seconds", type=float, default=DEFAULTS["fragment_gap_seconds"])
     parser.add_argument("--fragment-short-point-seconds", type=float, default=DEFAULTS["fragment_short_point_seconds"])
@@ -120,7 +114,6 @@ def parse_args() -> argparse.Namespace:
         default="libx264",
         help="Video encoder used for exported clips. Default stays on libx264 because videotoolbox is unstable in the current environment.",
     )
-    parser.add_argument("--skip-compact", action="store_true", help="Only generate point clips for this run.")
     return parser.parse_args()
 
 
@@ -563,50 +556,6 @@ def merge_fragmented_point_clips(
     return merged
 
 
-def build_compact_clips(
-    point_clips: Sequence[Clip],
-    source_video_id: str,
-    compact_gap_seconds: float,
-    compact_max_duration: float,
-    compact_max_points: int,
-) -> List[Clip]:
-    compacts: List[Clip] = []
-    current: List[Clip] = []
-
-    def flush(group: List[Clip]) -> None:
-        if not group:
-            return
-        start = group[0].start_time
-        end = group[-1].end_time
-        compacts.append(
-            Clip(
-                clip_id=f"compact-{len(compacts) + 1:03d}",
-                source_video_id=source_video_id,
-                start_time=start,
-                end_time=end,
-                duration=round(end - start, 3),
-                confidence=round(sum(c.confidence for c in group) / len(group), 2),
-                boundary_evidence={"group_size": len(group)},
-                child_point_clip_ids=[clip.clip_id for clip in group],
-                aggregation_reason=f"gap<={compact_gap_seconds}s and total_duration<={compact_max_duration}s",
-            )
-        )
-
-    for clip in point_clips:
-        if not current:
-            current = [clip]
-            continue
-        gap = clip.start_time - current[-1].end_time
-        projected_duration = clip.end_time - current[0].start_time
-        if gap <= compact_gap_seconds and projected_duration <= compact_max_duration and len(current) < compact_max_points:
-            current.append(clip)
-        else:
-            flush(current)
-            current = [clip]
-    flush(current)
-    return compacts
-
-
 def build_activity_clusters(
     motion_windows: Sequence[Tuple[float, float]],
     activity_threshold: float,
@@ -745,6 +694,7 @@ def enrich_boundary_evidence(
     point_clips: Sequence[Clip],
     *,
     min_point_duration: float,
+    max_point_duration: float,
 ) -> List[Clip]:
     enriched: List[Clip] = []
     for clip in point_clips:
@@ -754,30 +704,46 @@ def enrich_boundary_evidence(
         end_support = evidence.get("supporting_silence_after")
         has_start_anchor = start_support is not None
         has_end_anchor = end_support is not None
+        has_any_anchor = has_start_anchor or has_end_anchor
         evidence["start_anchor"] = "silence_before" if has_start_anchor else "unresolved"
         evidence["end_anchor"] = "silence_after" if has_end_anchor else "unresolved"
         evidence["source_signals"] = ["audio_silence", "audio_rms", "motion_activity"]
         evidence["trim_actions"] = evidence.get("trim_actions", [])
+        evidence["anchor_summary"] = {
+            "has_start_anchor": has_start_anchor,
+            "has_end_anchor": has_end_anchor,
+            "has_any_anchor": has_any_anchor,
+        }
         uncertain_reasons: List[str] = []
-        if not has_start_anchor:
-            uncertain_reasons.append("missing_start_anchor")
-        if not has_end_anchor:
-            uncertain_reasons.append("missing_end_anchor")
+        duration_flag = str(evidence.get("duration_flag", "normal"))
+        is_short_rally_clip = candidate.duration < max(10.0, min_point_duration * 1.5)
+        is_long_without_anchor = duration_flag == "long" and not has_any_anchor
+        if is_long_without_anchor:
+            uncertain_reasons.append("long_without_anchor")
         if candidate.duration < min_point_duration:
             uncertain_reasons.append("below_min_point_duration")
         quality_flags: List[str] = list(evidence.get("quality_flags", []))
-        if candidate.duration < max(10.0, min_point_duration * 1.5):
+        if is_short_rally_clip:
             quality_flags.append("short_rally_clip")
+        if is_long_without_anchor:
+            quality_flags.append("long_without_anchor")
         evidence["quality_flags"] = sorted(set(quality_flags))
         if uncertain_reasons:
             evidence["boundary_status"] = "uncertain"
             evidence["uncertain_reason"] = uncertain_reasons
-            evidence["anchor_confidence"] = 0.0
-            candidate.confidence = round(min(candidate.confidence, 0.35), 2)
+            evidence["anchor_confidence"] = 0.2 if has_any_anchor else 0.0
+            candidate.confidence = round(min(candidate.confidence, 0.42), 2)
         else:
             evidence["boundary_status"] = "confirmed"
             evidence["uncertain_reason"] = []
-            evidence["anchor_confidence"] = 0.9
+            if has_start_anchor and has_end_anchor:
+                evidence["anchor_confidence"] = 0.9
+            elif has_any_anchor:
+                evidence["anchor_confidence"] = 0.65
+            elif duration_flag == "normal" and candidate.duration <= max_point_duration:
+                evidence["anchor_confidence"] = 0.45
+            else:
+                evidence["anchor_confidence"] = 0.3
         candidate.boundary_evidence = evidence
         enriched.append(candidate)
     return enriched
@@ -810,7 +776,6 @@ def main() -> int:
     run_dir = clips_dir / source_id / run_id
     logs_dir = run_dir / "logs"
     points_dir = run_dir / "point_clips"
-    compact_dir = run_dir / "compact_clips"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     backup = backup_source(input_path, raw_dir, args.force_backup)
@@ -895,28 +860,14 @@ def main() -> int:
     point_clips = enrich_boundary_evidence(
         point_clips,
         min_point_duration=args.min_point_duration,
+        max_point_duration=args.max_point_duration,
     )
-    compact_clips: List[Clip] = []
-    if not args.skip_compact:
-        compact_clips = build_compact_clips(
-            point_clips=point_clips,
-            source_video_id=source_id,
-            compact_gap_seconds=args.compact_gap_seconds,
-            compact_max_duration=args.compact_max_duration,
-            compact_max_points=args.compact_max_points,
-        )
 
     if not args.analysis_only:
         for clip in point_clips:
             destination = points_dir / f"{clip.clip_id}_{hhmmss(clip.start_time).replace(':', '-')}_{hhmmss(clip.end_time).replace(':', '-')}.mp4"
             export_clip(backup_path, destination, clip.start_time, clip.end_time, args.video_encoder)
             clip.export_path = str(destination)
-
-        if not args.skip_compact:
-            for clip in compact_clips:
-                destination = compact_dir / f"{clip.clip_id}_{hhmmss(clip.start_time).replace(':', '-')}_{hhmmss(clip.end_time).replace(':', '-')}.mp4"
-                export_clip(backup_path, destination, clip.start_time, clip.end_time, args.video_encoder)
-                clip.export_path = str(destination)
 
     summary = {
         "input": str(input_path),
@@ -930,9 +881,6 @@ def main() -> int:
             "post_roll_seconds": args.post_roll_seconds,
             "min_point_duration": args.min_point_duration,
             "max_point_duration": args.max_point_duration,
-            "compact_gap_seconds": args.compact_gap_seconds,
-            "compact_max_duration": args.compact_max_duration,
-            "compact_max_points": args.compact_max_points,
             "min_silence_duration": args.min_silence_duration,
             "fragment_gap_seconds": args.fragment_gap_seconds,
             "fragment_short_point_seconds": args.fragment_short_point_seconds,
@@ -946,7 +894,6 @@ def main() -> int:
             "motion_tail_trim_policy": "ignored_in_v1_1",
             "motion_buffer_seconds": args.motion_buffer_seconds,
             "video_encoder": args.video_encoder,
-            "skip_compact": args.skip_compact,
             "rms_threshold_dbfs": round(rms_threshold, 3),
             "silence_threshold_dbfs": round(silence_threshold, 3),
             "noise_floor_dbfs": round(noise_floor, 3),
@@ -959,11 +906,11 @@ def main() -> int:
             "silences": len(silences),
             "active_intervals": len(active_intervals),
             "point_clips": len(point_clips),
-            "compact_clips": len(compact_clips),
+            "compact_clips": 0,
         },
         "silences": [asdict(silence) for silence in silences],
         "point_clips": serialise_clips(point_clips),
-        "compact_clips": serialise_clips(compact_clips),
+        "compact_clips": [],
         "logs": {"silencedetect": str(silence_log_path)},
         "analysis_only": args.analysis_only,
     }
