@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -22,11 +23,11 @@ DEFAULTS = {
     "config_path": "config.toml",
     "frames_per_clip": 6,
     "image_detail": "low",
-    "primary_model": "google/gemini-2.5-flash",
-    "fallback_model": "google/gemini-2.5-pro",
+    "primary_model": "google/gemini-2.5-pro",
+    "fallback_model": "",
     "timeout_seconds": 180,
-    "api_base": "https://openrouter.ai/api/v1/chat/completions",
-    "api_key_env_var": "OPENROUTER_API_KEY",
+    "api_base": "https://generativelanguage.googleapis.com/v1beta",
+    "api_key_env_var": "GEMINI_API_KEY",
     "max_memory_chars": 32000,
 }
 
@@ -43,15 +44,98 @@ SYSTEM_PROMPT = """你是网球技术分析教练。
 - 只根据提供的视频证据和上下文做判断。
 - 明确区分 observed、inferred、uncertain。
 - selection 阶段的 model_judgement 和 cv_evidence 只是辅助证据，不是最终技术结论。
+- 历史记忆文档只能作为背景上下文，不能单独支撑任何技术判断。
+- 每一处观点都必须绑定到至少一个具体视频片段，必须给出 selection_id、clip_id、time_range 和具体观察。
+- 如果某个观点找不到对应的视频片段证据，就不要输出这个观点。
 - 不要输出泛泛鼓励，不要空泛鸡汤。
 - 如果证据不足，明确写 uncertain 或放入 open_questions。
 """
+
+VIDEO_EVIDENCE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["selection_id", "clip_id", "time_range", "observation"],
+    "properties": {
+        "selection_id": {"type": "string"},
+        "clip_id": {"type": "string"},
+        "time_range": {"type": "string"},
+        "observation": {"type": "string"},
+    },
+}
+
+STATE_POINT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["point", "video_evidence", "context_evidence"],
+    "properties": {
+        "point": {"type": "string"},
+        "video_evidence": {"type": "array", "items": VIDEO_EVIDENCE_SCHEMA},
+        "context_evidence": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+INSIGHT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["title", "detail", "status", "confidence", "video_evidence", "context_evidence", "related_clip_ids"],
+    "properties": {
+        "title": {"type": "string"},
+        "detail": {"type": "string"},
+        "status": {"type": "string"},
+        "confidence": {"type": "number"},
+        "video_evidence": {"type": "array", "items": VIDEO_EVIDENCE_SCHEMA},
+        "context_evidence": {"type": "array", "items": {"type": "string"}},
+        "related_clip_ids": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+ACTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["action", "detail", "status", "confidence", "video_evidence", "context_evidence", "related_clip_ids"],
+    "properties": {
+        "action": {"type": "string"},
+        "detail": {"type": "string"},
+        "status": {"type": "string"},
+        "confidence": {"type": "number"},
+        "video_evidence": {"type": "array", "items": VIDEO_EVIDENCE_SCHEMA},
+        "context_evidence": {"type": "array", "items": {"type": "string"}},
+        "related_clip_ids": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+KEEP_DOING_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["item", "detail", "status", "confidence", "video_evidence", "context_evidence", "related_clip_ids"],
+    "properties": {
+        "item": {"type": "string"},
+        "detail": {"type": "string"},
+        "status": {"type": "string"},
+        "confidence": {"type": "number"},
+        "video_evidence": {"type": "array", "items": VIDEO_EVIDENCE_SCHEMA},
+        "context_evidence": {"type": "array", "items": {"type": "string"}},
+        "related_clip_ids": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+NEXT_FOCUS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["focus", "video_evidence", "context_evidence"],
+    "properties": {
+        "focus": {"type": "string"},
+        "video_evidence": {"type": "array", "items": VIDEO_EVIDENCE_SCHEMA},
+        "context_evidence": {"type": "array", "items": {"type": "string"}},
+    },
+}
 
 ANALYSIS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": [
         "session_summary",
+        "session_summary_evidence",
         "goal_assessment",
         "state_assessment",
         "top_findings",
@@ -63,6 +147,7 @@ ANALYSIS_SCHEMA: dict[str, Any] = {
     ],
     "properties": {
         "session_summary": {"type": "string"},
+        "session_summary_evidence": {"type": "array", "items": VIDEO_EVIDENCE_SCHEMA},
         "goal_assessment": {
             "type": "object",
             "additionalProperties": False,
@@ -72,7 +157,8 @@ ANALYSIS_SCHEMA: dict[str, Any] = {
                 "core_goal",
                 "attainment_status",
                 "attainment_score",
-                "evidence",
+                "video_evidence",
+                "context_evidence",
             ],
             "properties": {
                 "current_technique": {"type": "string"},
@@ -80,69 +166,33 @@ ANALYSIS_SCHEMA: dict[str, Any] = {
                 "core_goal": {"type": "string"},
                 "attainment_status": {"type": "string"},
                 "attainment_score": {"type": "number"},
-                "evidence": {"type": "array", "items": {"type": "string"}},
+                "video_evidence": {"type": "array", "items": VIDEO_EVIDENCE_SCHEMA},
+                "context_evidence": {"type": "array", "items": {"type": "string"}},
             },
         },
         "state_assessment": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["overall_state", "strengths", "weaknesses", "confidence", "evidence"],
+            "required": [
+                "overall_state",
+                "overall_state_evidence",
+                "strengths",
+                "weaknesses",
+                "confidence",
+                "context_evidence",
+            ],
             "properties": {
                 "overall_state": {"type": "string"},
-                "strengths": {"type": "array", "items": {"type": "string"}},
-                "weaknesses": {"type": "array", "items": {"type": "string"}},
+                "overall_state_evidence": {"type": "array", "items": VIDEO_EVIDENCE_SCHEMA},
+                "strengths": {"type": "array", "items": STATE_POINT_SCHEMA},
+                "weaknesses": {"type": "array", "items": STATE_POINT_SCHEMA},
                 "confidence": {"type": "number"},
-                "evidence": {"type": "array", "items": {"type": "string"}},
+                "context_evidence": {"type": "array", "items": {"type": "string"}},
             },
         },
-        "top_findings": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["title", "detail", "status", "confidence", "evidence", "related_clip_ids"],
-                "properties": {
-                    "title": {"type": "string"},
-                    "detail": {"type": "string"},
-                    "status": {"type": "string"},
-                    "confidence": {"type": "number"},
-                    "evidence": {"type": "array", "items": {"type": "string"}},
-                    "related_clip_ids": {"type": "array", "items": {"type": "string"}},
-                },
-            },
-        },
-        "priority_actions": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["action", "detail", "status", "confidence", "evidence", "related_clip_ids"],
-                "properties": {
-                    "action": {"type": "string"},
-                    "detail": {"type": "string"},
-                    "status": {"type": "string"},
-                    "confidence": {"type": "number"},
-                    "evidence": {"type": "array", "items": {"type": "string"}},
-                    "related_clip_ids": {"type": "array", "items": {"type": "string"}},
-                },
-            },
-        },
-        "keep_doing": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["item", "detail", "status", "confidence", "evidence", "related_clip_ids"],
-                "properties": {
-                    "item": {"type": "string"},
-                    "detail": {"type": "string"},
-                    "status": {"type": "string"},
-                    "confidence": {"type": "number"},
-                    "evidence": {"type": "array", "items": {"type": "string"}},
-                    "related_clip_ids": {"type": "array", "items": {"type": "string"}},
-                },
-            },
-        },
+        "top_findings": {"type": "array", "items": INSIGHT_SCHEMA},
+        "priority_actions": {"type": "array", "items": ACTION_SCHEMA},
+        "keep_doing": {"type": "array", "items": KEEP_DOING_SCHEMA},
         "clip_notes": {
             "type": "array",
             "items": {
@@ -150,6 +200,8 @@ ANALYSIS_SCHEMA: dict[str, Any] = {
                 "additionalProperties": False,
                 "required": [
                     "selection_id",
+                    "clip_id",
+                    "time_range",
                     "observed",
                     "inferred",
                     "uncertain",
@@ -158,6 +210,8 @@ ANALYSIS_SCHEMA: dict[str, Any] = {
                 ],
                 "properties": {
                     "selection_id": {"type": "string"},
+                    "clip_id": {"type": "string"},
+                    "time_range": {"type": "string"},
                     "observed": {"type": "array", "items": {"type": "string"}},
                     "inferred": {"type": "array", "items": {"type": "string"}},
                     "uncertain": {"type": "array", "items": {"type": "string"}},
@@ -167,7 +221,7 @@ ANALYSIS_SCHEMA: dict[str, Any] = {
             },
         },
         "open_questions": {"type": "array", "items": {"type": "string"}},
-        "next_session_focus": {"type": "array", "items": {"type": "string"}},
+        "next_session_focus": {"type": "array", "items": NEXT_FOCUS_SCHEMA},
     },
 }
 
@@ -227,6 +281,39 @@ def ffprobe_duration(video_path: pathlib.Path) -> float:
         )
     )
     return float(data["format"]["duration"])
+
+
+def format_timecode(seconds: float | int | None) -> str:
+    if seconds is None:
+        return "unknown"
+    total_ms = int(round(float(seconds) * 1000))
+    ms = total_ms % 1000
+    total_seconds = total_ms // 1000
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{ms:03d}"
+
+
+def selection_time_range(item: dict[str, Any]) -> str:
+    export_window = item.get("export_window") or {}
+    start = export_window.get("absolute_start_time")
+    end = export_window.get("absolute_end_time")
+    if start is None or end is None:
+        return "unknown"
+    return f"{format_timecode(start)}-{format_timecode(end)}"
+
+
+def selection_reference(item: dict[str, Any]) -> dict[str, str]:
+    return {
+        "selection_id": str(item.get("selection_id", "")),
+        "clip_id": str(item.get("clip_id", "")),
+        "time_range": selection_time_range(item),
+    }
+
+
+def selection_index(selected_clips: list[dict[str, Any]]) -> dict[str, dict[str, str]]:
+    return {ref["selection_id"]: ref for ref in (selection_reference(item) for item in selected_clips)}
 
 
 def build_frame_timestamps(duration: float, frame_count: int) -> list[float]:
@@ -329,6 +416,13 @@ def build_user_text(selected_clips: list[dict[str, Any]], memory_docs: list[dict
     parts.append("2. 当天状态的整体判断，包括发挥好的技术特点和差的技术特点。")
     parts.append("3. 当天的主要问题，以及后续改进方案。")
     parts.append("4. 当天发挥好的方面，以及后续如何继续保持。")
+    parts.append("5. 每一条结论都必须绑定到具体视频片段，禁止只引用历史文档。")
+    parts.append("")
+    parts.append("视频证据输出强约束：")
+    parts.append("1. 任何分析观点都必须至少带一条 video_evidence。")
+    parts.append("2. video_evidence.selection_id / clip_id / time_range 必须原样抄写自下方片段 reference。")
+    parts.append("3. observation 必须描述该片段里实际看到的动作、站位、击球或结果，不能写抽象总结。")
+    parts.append("4. 如果没有具体片段证据，就不要输出该观点。")
     parts.append("")
     parts.append("历史记忆文档如下：")
     for doc in memory_docs:
@@ -338,6 +432,13 @@ def build_user_text(selected_clips: list[dict[str, Any]], memory_docs: list[dict
     parts.append("视频片段元数据如下：")
     for item in selected_clips:
         parts.append(f"### {item['selection_id']}")
+        parts.append(
+            json.dumps(
+                {"reference": selection_reference(item)},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         parts.append(
             json.dumps(
                 {
@@ -444,7 +545,86 @@ def call_openrouter(
         raise RuntimeError(f"OpenRouter request failed: {exc}") from exc
 
 
-def call_openrouter_with_fallback(
+def gemini_model_name(model: str) -> str:
+    return model.split("/")[-1] if "/" in model else model
+
+
+def convert_user_content_to_gemini_parts(user_content: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    parts: list[dict[str, Any]] = []
+    for item in user_content:
+        if item.get("type") == "text":
+            parts.append({"text": str(item.get("text", ""))})
+            continue
+        if item.get("type") != "image_url":
+            continue
+        image_url = item.get("image_url", {})
+        url = str(image_url.get("url", ""))
+        if not url.startswith("data:") or ";base64," not in url:
+            raise RuntimeError("Gemini conversion only supports base64 data URLs for image input")
+        mime_type, encoded = url[5:].split(";base64,", 1)
+        parts.append({"inline_data": {"mime_type": mime_type, "data": encoded}})
+    return parts
+
+
+def call_gemini_api(
+    *,
+    api_base: str,
+    api_key: str,
+    model: str,
+    timeout_seconds: int,
+    user_content: list[dict[str, Any]],
+) -> dict[str, Any]:
+    body = {
+        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [
+            {
+                "role": "user",
+                "parts": convert_user_content_to_gemini_parts(user_content),
+            }
+        ],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseJsonSchema": ANALYSIS_SCHEMA,
+        },
+    }
+    model_path = gemini_model_name(model)
+    endpoint = (
+        f"{api_base.rstrip('/')}/models/"
+        f"{urllib.parse.quote(model_path, safe='')}:generateContent?key={urllib.parse.quote(api_key, safe='')}"
+    )
+    req = urllib.request.Request(
+        endpoint,
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Gemini API request failed with {exc.code}\n{detail[-2000:]}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Gemini API request failed: {exc}") from exc
+
+
+def parse_gemini_response(payload: dict[str, Any]) -> dict[str, Any]:
+    candidates = payload.get("candidates", [])
+    if not candidates:
+        raise RuntimeError("Gemini API response has no candidates")
+    content = candidates[0].get("content", {})
+    parts = content.get("parts", [])
+    text_parts = [item.get("text", "") for item in parts if isinstance(item, dict) and item.get("text")]
+    if not text_parts:
+        raise RuntimeError("Unable to parse structured JSON content from Gemini API response")
+    return json.loads("".join(text_parts))
+
+
+def is_gemini_api_base(api_base: str) -> bool:
+    return "generativelanguage.googleapis.com" in api_base
+
+
+def call_model_with_fallback(
     *,
     api_base: str,
     api_key: str,
@@ -452,10 +632,12 @@ def call_openrouter_with_fallback(
     fallback_model: str | None,
     timeout_seconds: int,
     user_content: list[dict[str, Any]],
-) -> tuple[dict[str, Any], str]:
+) -> tuple[dict[str, Any], str, str]:
+    call_fn = call_gemini_api if is_gemini_api_base(api_base) else call_openrouter
+    provider_name = "gemini-api" if is_gemini_api_base(api_base) else "openrouter"
     try:
         return (
-            call_openrouter(
+            call_fn(
                 api_base=api_base,
                 api_key=api_key,
                 model=primary_model,
@@ -463,12 +645,13 @@ def call_openrouter_with_fallback(
                 user_content=user_content,
             ),
             primary_model,
+            provider_name,
         )
     except RuntimeError:
         if not fallback_model or fallback_model == primary_model:
             raise
         return (
-            call_openrouter(
+            call_fn(
                 api_base=api_base,
                 api_key=api_key,
                 model=fallback_model,
@@ -476,6 +659,7 @@ def call_openrouter_with_fallback(
                 user_content=user_content,
             ),
             fallback_model,
+            provider_name,
         )
 
 
@@ -500,6 +684,102 @@ def ensure_analysis_shape(payload: dict[str, Any]) -> None:
             raise RuntimeError(f"analysis result is missing required key: {key}")
 
 
+def validate_video_evidence_items(
+    items: list[dict[str, Any]],
+    selected_index: dict[str, dict[str, str]],
+    *,
+    field_name: str,
+) -> None:
+    if not items:
+        raise RuntimeError(f"{field_name} must contain at least one video evidence item")
+    for index, item in enumerate(items, start=1):
+        selection_id = str(item.get("selection_id", ""))
+        if selection_id not in selected_index:
+            raise RuntimeError(f"{field_name}[{index}] references unknown selection_id: {selection_id}")
+        expected = selected_index[selection_id]
+        if str(item.get("clip_id", "")) != expected["clip_id"]:
+            raise RuntimeError(
+                f"{field_name}[{index}] clip_id mismatch for {selection_id}: "
+                f"expected {expected['clip_id']}, got {item.get('clip_id')}"
+            )
+        if str(item.get("time_range", "")) != expected["time_range"]:
+            raise RuntimeError(
+                f"{field_name}[{index}] time_range mismatch for {selection_id}: "
+                f"expected {expected['time_range']}, got {item.get('time_range')}"
+            )
+        if not str(item.get("observation", "")).strip():
+            raise RuntimeError(f"{field_name}[{index}] observation must not be empty")
+
+
+def ensure_analysis_evidence(payload: dict[str, Any], selected_clips: list[dict[str, Any]]) -> None:
+    selected = selection_index(selected_clips)
+    validate_video_evidence_items(payload["session_summary_evidence"], selected, field_name="session_summary_evidence")
+
+    goal = payload["goal_assessment"]
+    validate_video_evidence_items(goal["video_evidence"], selected, field_name="goal_assessment.video_evidence")
+
+    state = payload["state_assessment"]
+    validate_video_evidence_items(
+        state["overall_state_evidence"],
+        selected,
+        field_name="state_assessment.overall_state_evidence",
+    )
+    for idx, item in enumerate(state["strengths"], start=1):
+        validate_video_evidence_items(
+            item["video_evidence"],
+            selected,
+            field_name=f"state_assessment.strengths[{idx}].video_evidence",
+        )
+    for idx, item in enumerate(state["weaknesses"], start=1):
+        validate_video_evidence_items(
+            item["video_evidence"],
+            selected,
+            field_name=f"state_assessment.weaknesses[{idx}].video_evidence",
+        )
+
+    for group_name in ("top_findings", "priority_actions", "keep_doing"):
+        for idx, item in enumerate(payload[group_name], start=1):
+            validate_video_evidence_items(
+                item["video_evidence"],
+                selected,
+                field_name=f"{group_name}[{idx}].video_evidence",
+            )
+
+    for idx, item in enumerate(payload["next_session_focus"], start=1):
+        validate_video_evidence_items(
+            item["video_evidence"],
+            selected,
+            field_name=f"next_session_focus[{idx}].video_evidence",
+        )
+
+    clip_note_ids = [str(item.get("selection_id", "")) for item in payload["clip_notes"]]
+    expected_ids = [str(item.get("selection_id", "")) for item in selected_clips]
+    if clip_note_ids != expected_ids:
+        raise RuntimeError("clip_notes must cover every selected clip exactly once and preserve order")
+    for idx, item in enumerate(payload["clip_notes"], start=1):
+        expected = selected[item["selection_id"]]
+        if str(item.get("clip_id", "")) != expected["clip_id"]:
+            raise RuntimeError(
+                f"clip_notes[{idx}] clip_id mismatch for {item['selection_id']}: "
+                f"expected {expected['clip_id']}, got {item.get('clip_id')}"
+            )
+        if str(item.get("time_range", "")) != expected["time_range"]:
+            raise RuntimeError(
+                f"clip_notes[{idx}] time_range mismatch for {item['selection_id']}: "
+                f"expected {expected['time_range']}, got {item.get('time_range')}"
+            )
+
+
+def render_video_evidence(items: list[dict[str, Any]]) -> str:
+    return "；".join(
+        f"{item['selection_id']} | {item['clip_id']} | {item['time_range']} | {item['observation']}" for item in items
+    )
+
+
+def render_context_evidence(items: list[str]) -> str:
+    return "；".join(items)
+
+
 def render_markdown(result: dict[str, Any], *, model_name: str) -> str:
     lines: list[str] = []
     lines.append("# 网球训练分析报告")
@@ -508,6 +788,7 @@ def render_markdown(result: dict[str, Any], *, model_name: str) -> str:
     lines.append("")
     lines.append("## Session Summary")
     lines.append(result["session_summary"])
+    lines.append(f"- 视频依据：{render_video_evidence(result['session_summary_evidence'])}")
     lines.append("")
     goal = result["goal_assessment"]
     lines.append("## Goal Assessment")
@@ -515,35 +796,80 @@ def render_markdown(result: dict[str, Any], *, model_name: str) -> str:
     lines.append(f"- 当前训练重点：{goal['current_training_focus']}")
     lines.append(f"- 核心目标：{goal['core_goal']}")
     lines.append(f"- 当天达成度：{goal['attainment_status']} ({goal['attainment_score']})")
+    lines.append(f"- 视频依据：{render_video_evidence(goal['video_evidence'])}")
+    if goal["context_evidence"]:
+        lines.append(f"- 背景上下文：{render_context_evidence(goal['context_evidence'])}")
     lines.append("")
     state = result["state_assessment"]
     lines.append("## State Assessment")
     lines.append(f"- 整体状态：{state['overall_state']}")
+    lines.append(f"- 整体状态依据：{render_video_evidence(state['overall_state_evidence'])}")
+    if state["context_evidence"]:
+        lines.append(f"- 背景上下文：{render_context_evidence(state['context_evidence'])}")
     if state["strengths"]:
-        lines.append(f"- 发挥好的特点：{'；'.join(state['strengths'])}")
+        lines.append("- 发挥好的特点：")
+        for item in state["strengths"]:
+            lines.append(f"  {item['point']}")
+            lines.append(f"  依据：{render_video_evidence(item['video_evidence'])}")
     if state["weaknesses"]:
-        lines.append(f"- 发挥差的特点：{'；'.join(state['weaknesses'])}")
+        lines.append("- 发挥差的特点：")
+        for item in state["weaknesses"]:
+            lines.append(f"  {item['point']}")
+            lines.append(f"  依据：{render_video_evidence(item['video_evidence'])}")
     lines.append("")
     lines.append("## Top Findings")
     for item in result["top_findings"]:
         lines.append(f"- {item['title']}：{item['detail']}")
+        lines.append(f"  视频依据：{render_video_evidence(item['video_evidence'])}")
+        if item["context_evidence"]:
+            lines.append(f"  背景上下文：{render_context_evidence(item['context_evidence'])}")
     lines.append("")
     lines.append("## Priority Actions")
     for item in result["priority_actions"]:
         lines.append(f"- {item['action']}：{item['detail']}")
+        lines.append(f"  视频依据：{render_video_evidence(item['video_evidence'])}")
+        if item["context_evidence"]:
+            lines.append(f"  背景上下文：{render_context_evidence(item['context_evidence'])}")
     lines.append("")
     lines.append("## Keep Doing")
     for item in result["keep_doing"]:
         lines.append(f"- {item['item']}：{item['detail']}")
+        lines.append(f"  视频依据：{render_video_evidence(item['video_evidence'])}")
+        if item["context_evidence"]:
+            lines.append(f"  背景上下文：{render_context_evidence(item['context_evidence'])}")
+    lines.append("")
+    lines.append("## Clip Notes")
+    for item in result["clip_notes"]:
+        lines.append(f"- {item['selection_id']} | {item['clip_id']} | {item['time_range']}")
+        if item["observed"]:
+            lines.append(f"  observed：{'；'.join(item['observed'])}")
+        if item["inferred"]:
+            lines.append(f"  inferred：{'；'.join(item['inferred'])}")
+        if item["uncertain"]:
+            lines.append(f"  uncertain：{'；'.join(item['uncertain'])}")
+        if item["key_strengths"]:
+            lines.append(f"  strengths：{'；'.join(item['key_strengths'])}")
+        if item["key_issues"]:
+            lines.append(f"  issues：{'；'.join(item['key_issues'])}")
     lines.append("")
     lines.append("## Next Session Focus")
     for item in result["next_session_focus"]:
-        lines.append(f"- {item}")
+        lines.append(f"- {item['focus']}")
+        lines.append(f"  视频依据：{render_video_evidence(item['video_evidence'])}")
+        if item["context_evidence"]:
+            lines.append(f"  背景上下文：{render_context_evidence(item['context_evidence'])}")
+    if result["open_questions"]:
+        lines.append("")
+        lines.append("## Open Questions")
+        for item in result["open_questions"]:
+            lines.append(f"- {item}")
     return "\n".join(lines) + "\n"
 
 
 def derive_output_dir(selection_package_path: pathlib.Path) -> pathlib.Path:
     run_id = time.strftime("%Y%m%d-%H%M%S")
+    if selection_package_path.parent.parent.name == "selection_runs":
+        return selection_package_path.parent.parent.parent / "analysis_runs" / run_id
     return selection_package_path.parent / "analysis_runs" / run_id
 
 
@@ -566,12 +892,13 @@ def main() -> None:
     fallback_model = str(openrouter_cfg.get("fallback_model", DEFAULTS["fallback_model"]))
     timeout_seconds = int(openrouter_cfg.get("timeout_seconds", DEFAULTS["timeout_seconds"]))
     api_base = str(openrouter_cfg.get("api_base", DEFAULTS["api_base"]))
+    api_key_value = str(openrouter_cfg.get("api_key", "")).strip()
     api_key_env_var = str(openrouter_cfg.get("api_key_env_var", DEFAULTS["api_key_env_var"]))
     max_memory_chars = int(analysis_cfg.get("max_memory_chars", DEFAULTS["max_memory_chars"]))
 
-    api_key = os.environ.get(api_key_env_var, "")
+    api_key = api_key_value or os.environ.get(api_key_env_var, "")
     if not api_key:
-        raise SystemExit(f"Missing API key in environment variable: {api_key_env_var}")
+        raise SystemExit(f"Missing API key: set analysis.openrouter.api_key or environment variable {api_key_env_var}")
 
     selected_clips = selection_package["selected_clips"]
     memory_docs = load_memory_documents(memory_root, max_memory_chars=max_memory_chars)
@@ -582,7 +909,7 @@ def main() -> None:
         image_detail=image_detail,
         user_text=user_text,
     )
-    raw_response, used_model = call_openrouter_with_fallback(
+    raw_response, used_model, provider_name = call_model_with_fallback(
         api_base=api_base,
         api_key=api_key,
         primary_model=primary_model,
@@ -590,15 +917,16 @@ def main() -> None:
         timeout_seconds=timeout_seconds,
         user_content=user_content,
     )
-    result = parse_openrouter_response(raw_response)
+    result = parse_gemini_response(raw_response) if is_gemini_api_base(api_base) else parse_openrouter_response(raw_response)
     ensure_analysis_shape(result)
+    ensure_analysis_evidence(result, selected_clips)
 
     output_dir = derive_output_dir(selection_package_path)
     output_dir.mkdir(parents=True, exist_ok=True)
     result_with_trace = {
         **result,
         "trace": {
-            "provider": "openrouter",
+            "provider": provider_name,
             "model": used_model,
         },
     }

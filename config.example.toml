@@ -54,11 +54,11 @@ frames_per_clip = 6
 max_memory_chars = 32000
 
 [analysis.openrouter]
-# Current v1 analysis path uses OpenRouter plus Gemini 2.5 Flash keyframe analysis.
-model = "google/gemini-2.5-flash"
+# Current v1 analysis path uses OpenRouter plus Gemini 2.5 Pro keyframe analysis.
+model = "google/gemini-2.5-pro"
 
-# Fallback model when Flash is unavailable or returns an unusable result.
-fallback_model = "google/gemini-2.5-pro"
+# Leave empty to avoid silently downgrading analysis quality.
+fallback_model = ""
 
 # Environment variable that stores the API key.
 api_key_env_var = "OPENROUTER_API_KEY"
