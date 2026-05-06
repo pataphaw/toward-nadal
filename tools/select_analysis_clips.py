@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
+import fcntl
 import hashlib
 import json
 import math
 import pathlib
+import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -49,13 +53,13 @@ DEFAULTS = {
     "rally_quiet_active_ratio_threshold": 0.035,
     "rally_quiet_gap_seconds": 3.5,
     "max_focus_windows_per_clip": 3,
-    "candidate_pool_size": 18,
-    "selected_size": 6,
-    "frames_per_candidate": 9,
+    "candidate_pool_size": 4,
+    "selected_size": 3,
+    "frames_per_candidate": 2,
     "config_path": "config.toml",
     "local_vlm_provider": "ollama",
     "local_vlm_endpoint": "http://localhost:11434/api/chat",
-    "local_vlm_model": "qwen2.5vl:7b",
+    "local_vlm_model": "qwen2.5vl:3b",
     "local_vlm_fallback_model": "qwen2.5vl:3b",
     "local_vlm_timeout_seconds": 120,
     "local_vlm_max_retries": 1,
@@ -129,7 +133,28 @@ MODEL_PROMPT_TEMPLATE = """你是网球训练视频片段筛选器。你只判�
 
 如果证据不足，必须输出 uncertain。不要因为动作不好就排除问题样本。不要输出最终技术诊断。
 
-必须严格按 JSON schema 输出，不要输出 schema 之外的字段。"""
+必须只输出一个 JSON object，且字段必须完整，不能省略，不能添加额外字段。
+
+输出格式固定如下：
+{
+  "schema_version": "model_judgement.v1",
+  "candidate_id": "<输入里的 candidate_id>",
+  "in_play": "yes|no|uncertain",
+  "non_play_type": "none|picking_ball|resting|walking|waiting|camera_noise|uncertain",
+  "rally_completeness": "complete|partial_start_missing|partial_end_missing|multi_rally|uncertain",
+  "action_tags": ["forehand|backhand|serve"],
+  "context_tags": ["baseline|midcourt|running|stationary"],
+  "value_tags": ["highlight|good_example|problem_example"],
+  "reject_reasons": ["..."],
+  "selection_reason": "...",
+  "confidence": 0.0
+}
+
+规则补充：
+- 如果 in_play = "yes"，non_play_type 应为 "none" 或 "uncertain"。
+- 如果 in_play = "no"，value_tags 必须为空数组。
+- confidence 必须是 0 到 1 之间的数字。
+- 如果没有明显证据，不要猜，使用 uncertain。"""
 
 
 def run_command(args: Sequence[str], *, capture_stdout: bool = False) -> str:
@@ -163,6 +188,60 @@ def ffprobe_json(video_path: pathlib.Path) -> dict[str, Any]:
     )
 
 
+def ollama_ps_rows() -> list[dict[str, str]]:
+    raw = run_command(["ollama", "ps"], capture_stdout=True)
+    lines = [line.rstrip() for line in raw.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        return []
+    rows: list[dict[str, str]] = []
+    for line in lines[1:]:
+        parts = line.split()
+        if not parts:
+            continue
+        rows.append({"name": parts[0], "raw": line})
+    return rows
+
+
+def stop_ollama_model(model_name: str) -> None:
+    if not model_name:
+        return
+    run_command(["ollama", "stop", model_name], capture_stdout=True)
+
+
+def ensure_ollama_idle(*, wait_timeout_seconds: int = 45, poll_seconds: float = 1.5) -> list[dict[str, str]]:
+    rows = ollama_ps_rows()
+    if not rows:
+        return []
+    for row in rows:
+        try:
+            stop_ollama_model(row["name"])
+        except RuntimeError:
+            # Best-effort cleanup; continue into polling because stop may race with teardown.
+            pass
+    deadline = time.time() + wait_timeout_seconds
+    last_rows = rows
+    while time.time() < deadline:
+        rows = ollama_ps_rows()
+        if not rows:
+            return []
+        last_rows = rows
+        time.sleep(poll_seconds)
+    return last_rows
+
+
+@contextlib.contextmanager
+def local_vlm_lock(lock_path: pathlib.Path) -> Iterable[None]:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        handle.write(str(time.time()))
+        handle.flush()
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Select a small set of analysis-ready candidates from a segmentation run."
@@ -179,12 +258,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--selected-clips-dir",
-        help="Optional export directory for selected focus clips. Defaults to <run-dir>/selected_clips/<selection-run-id>/.",
+        help="Optional export directory for promoted selected clips. Defaults to <run-dir>/selected_clips/.",
     )
     parser.add_argument(
         "--skip-export-clips",
         action="store_true",
         help="Do not export focus-window video snippets for selected clips.",
+    )
+    parser.add_argument(
+        "--skip-promote-selected-clips",
+        action="store_true",
+        help="Do not overwrite the run-level selected_clips/ final output directory for this run.",
     )
     parser.add_argument("--selection-run-id", help="Optional stable selection run id.")
     parser.add_argument(
@@ -1621,6 +1705,7 @@ def parse_simple_toml(path: pathlib.Path) -> dict[str, Any]:
 
 def apply_config_defaults(args: argparse.Namespace) -> None:
     config = parse_simple_toml(pathlib.Path(args.config).expanduser())
+    explicit_flags = set(sys.argv[1:])
     mapping = {
         "selection.candidate_pool_size": ("candidate_pool_size", DEFAULTS["candidate_pool_size"]),
         "selection.selected_size": ("selected_size", DEFAULTS["selected_size"]),
@@ -1635,6 +1720,9 @@ def apply_config_defaults(args: argparse.Namespace) -> None:
     }
     for config_key, (arg_name, default_value) in mapping.items():
         if config_key not in config:
+            continue
+        flag_name = f"--{arg_name.replace('_', '-')}"
+        if flag_name in explicit_flags:
             continue
         if getattr(args, arg_name) != default_value:
             continue
@@ -1880,7 +1968,7 @@ def build_model_input_packages(
             window=candidate["export_window_proposal"],
             output_path=candidate_video_path,
         )
-        frame_paths = extract_candidate_frames(candidate_video_path, frames_dir, max(6, min(12, frames_per_candidate)))
+        frame_paths = extract_candidate_frames(candidate_video_path, frames_dir, max(1, min(12, frames_per_candidate)))
         prompt_path.write_text(MODEL_PROMPT_TEMPLATE, encoding="utf-8")
 
         input_payload = {
@@ -1971,18 +2059,23 @@ def call_ollama_chat(
     candidate_payload: dict[str, Any],
     timeout_seconds: int,
     temperature: float,
-) -> tuple[dict[str, Any], str]:
+) -> tuple[str, str]:
     images_base64 = [base64.b64encode(pathlib.Path(path).read_bytes()).decode("ascii") for path in image_paths]
+    prompt_payload = {
+        key: value
+        for key, value in candidate_payload.items()
+        if key not in {"frame_paths", "input_hash"}
+    }
     user_prompt = (
         f"{prompt}\n\n候选元数据与 CV 证据：\n"
-        f"{json.dumps(candidate_payload, ensure_ascii=False)}\n\n"
+        f"{json.dumps(prompt_payload, ensure_ascii=False)}\n\n"
         "请返回严格 JSON。"
     )
     payload = {
         "model": model,
         "stream": False,
-        "format": MODEL_JUDGEMENT_SCHEMA,
-        "options": {"temperature": float(temperature)},
+        "format": "json",
+        "options": {"temperature": float(temperature), "num_predict": 220},
         "messages": [{"role": "user", "content": user_prompt, "images": images_base64}],
     }
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -2000,7 +2093,7 @@ def call_ollama_chat(
     content = response.get("message", {}).get("content", "")
     if not content:
         raise RuntimeError("empty_model_content")
-    return parse_json_maybe_wrapped(content), raw_body
+    return content, raw_body
 
 
 def run_model_judgements(
@@ -2016,71 +2109,84 @@ def run_model_judgements(
     judgements: list[dict[str, Any]] = []
     any_success = False
     used_fallback = False
+    last_global_error: str | None = None
     models = [primary_model]
     if fallback_model and fallback_model != primary_model:
         models.append(fallback_model)
+    pending_rows = ensure_ollama_idle()
+    if pending_rows:
+        return [], False, False, f"ollama_not_idle:{'; '.join(row['name'] for row in pending_rows)}"
+    try:
+        for package in model_input_packages:
+            candidate_id = str(package["candidate_id"])
+            candidate_payload = json.loads(pathlib.Path(package["input_json_path"]).read_text(encoding="utf-8"))
+            prompt = pathlib.Path(package["prompt_path"]).read_text(encoding="utf-8")
+            success = False
+            last_error = ""
+            transport_error = False
+            response_path = pathlib.Path(package["input_dir"]) / "model_response.json"
+            judgement_path = pathlib.Path(package["input_dir"]) / "judgement.json"
 
-    for package in model_input_packages:
-        candidate_id = str(package["candidate_id"])
-        candidate_payload = json.loads(pathlib.Path(package["input_json_path"]).read_text(encoding="utf-8"))
-        prompt = pathlib.Path(package["prompt_path"]).read_text(encoding="utf-8")
-        success = False
-        last_error = ""
-        transport_error = False
-        response_path = pathlib.Path(package["input_dir"]) / "model_response.json"
-        judgement_path = pathlib.Path(package["input_dir"]) / "judgement.json"
-
-        for model_name in models:
-            for _ in range(max(1, max_retries + 1)):
-                try:
-                    raw_judgement, raw_response = call_ollama_chat(
-                        endpoint=endpoint,
-                        model=model_name,
-                        prompt=prompt,
-                        image_paths=list(package["frame_paths"]),
-                        candidate_payload=candidate_payload,
-                        timeout_seconds=timeout_seconds,
-                        temperature=temperature,
-                    )
-                    judgement = validate_model_judgement(raw_judgement, candidate_id=candidate_id)
-                    response_path.write_text(raw_response, encoding="utf-8")
-                    judgement["model_name"] = model_name
-                    judgement_path.write_text(json.dumps(judgement, ensure_ascii=False, indent=2), encoding="utf-8")
-                    judgements.append(judgement)
-                    any_success = True
-                    if model_name == fallback_model and model_name != primary_model:
-                        used_fallback = True
-                    success = True
+            for model_name in models:
+                for _ in range(max(1, max_retries + 1)):
+                    try:
+                        raw_content, raw_response = call_ollama_chat(
+                            endpoint=endpoint,
+                            model=model_name,
+                            prompt=prompt,
+                            image_paths=list(package["frame_paths"]),
+                            candidate_payload=candidate_payload,
+                            timeout_seconds=timeout_seconds,
+                            temperature=temperature,
+                        )
+                        response_path.write_text(raw_response, encoding="utf-8")
+                        raw_judgement = parse_json_maybe_wrapped(raw_content)
+                        judgement = validate_model_judgement(raw_judgement, candidate_id=candidate_id)
+                        judgement["model_name"] = model_name
+                        judgement_path.write_text(json.dumps(judgement, ensure_ascii=False, indent=2), encoding="utf-8")
+                        judgements.append(judgement)
+                        any_success = True
+                        if model_name == fallback_model and model_name != primary_model:
+                            used_fallback = True
+                        success = True
+                        break
+                    except RuntimeError as exc:
+                        last_error = str(exc)
+                        last_global_error = last_error
+                        transport_error = True
+                    except (json.JSONDecodeError, ValueError) as exc:
+                        last_error = str(exc)
+                        last_global_error = last_error
+                        transport_error = False
+                        continue
+                if success:
                     break
-                except RuntimeError as exc:
-                    last_error = str(exc)
-                    transport_error = True
-                except (json.JSONDecodeError, ValueError) as exc:
-                    last_error = str(exc)
-                    transport_error = False
-                    continue
-            if success:
-                break
-        if not success:
-            if transport_error and not any_success:
-                return [], any_success, used_fallback, last_error
-            fallback = {
-                "schema_version": "model_judgement.v1",
-                "candidate_id": candidate_id,
-                "in_play": "uncertain",
-                "non_play_type": "uncertain",
-                "rally_completeness": "uncertain",
-                "action_tags": [],
-                "context_tags": [],
-                "value_tags": [],
-                "reject_reasons": ["invalid-model-output", last_error[:160]],
-                "selection_reason": "Model output invalid after retry.",
-                "confidence": 0.0,
-                "model_name": None,
-            }
-            judgement_path.write_text(json.dumps(fallback, ensure_ascii=False, indent=2), encoding="utf-8")
-            judgements.append(fallback)
-    return judgements, any_success, used_fallback, None
+            if not success:
+                if transport_error and not any_success:
+                    return [], any_success, used_fallback, last_error
+                fallback = {
+                    "schema_version": "model_judgement.v1",
+                    "candidate_id": candidate_id,
+                    "in_play": "uncertain",
+                    "non_play_type": "uncertain",
+                    "rally_completeness": "uncertain",
+                    "action_tags": [],
+                    "context_tags": [],
+                    "value_tags": [],
+                    "reject_reasons": ["invalid-model-output", last_error[:160]],
+                    "selection_reason": "Model output invalid after retry.",
+                    "confidence": 0.0,
+                    "model_name": None,
+                }
+                judgement_path.write_text(json.dumps(fallback, ensure_ascii=False, indent=2), encoding="utf-8")
+                judgements.append(fallback)
+        return judgements, any_success, used_fallback, None if any_success else last_global_error
+    finally:
+        for model_name in reversed(models):
+            try:
+                stop_ollama_model(model_name)
+            except RuntimeError:
+                pass
 
 
 def derive_semantic_tags(judgement: dict[str, Any]) -> dict[str, Any]:
@@ -2386,7 +2492,11 @@ def select_with_coverage(
 def export_selected_clips(
     selected: list[dict[str, Any]],
     export_dir: pathlib.Path,
+    *,
+    selection_run_id: str,
 ) -> list[dict[str, Any]]:
+    if export_dir.exists():
+        shutil.rmtree(export_dir)
     export_dir.mkdir(parents=True, exist_ok=True)
     exports: list[dict[str, Any]] = []
     for index, candidate in enumerate(selected, start=1):
@@ -2411,6 +2521,13 @@ def export_selected_clips(
                 ),
             }
         )
+    manifest = {
+        "selection_run_id": selection_run_id,
+        "exported_at_epoch": round(time.time(), 3),
+        "selected_count": len(exports),
+        "exports": exports,
+    }
+    (export_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return exports
 
 
@@ -2437,7 +2554,7 @@ def main() -> None:
     selected_clips_dir = (
         pathlib.Path(args.selected_clips_dir).resolve()
         if args.selected_clips_dir
-        else run_dir / "selected_clips" / selection_run_id
+        else run_dir / "selected_clips"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     started_at = time.time()
@@ -2471,6 +2588,8 @@ def main() -> None:
             "infeasible_reasons": ["empty-point-clips"],
             "selected_clip_exports_dir": None,
             "selected_clip_exports": [],
+            "selected_clips_result_role": "trial",
+            "promoted_selected_clips": False,
             "selection_notes": {},
         }
         output_path = output_dir / "selection-package.json"
@@ -2508,22 +2627,27 @@ def main() -> None:
                 }
             )
 
-    cv_candidate_pool = build_cv_candidate_pool(raw_candidates, candidate_pool_size=max(12, min(24, args.candidate_pool_size)))
+    candidate_pool_size = max(1, int(args.candidate_pool_size))
+    frames_per_candidate = max(1, min(12, int(args.frames_per_candidate)))
+    cv_candidate_pool = build_cv_candidate_pool(raw_candidates, candidate_pool_size=candidate_pool_size)
     model_input_packages = build_model_input_packages(
         cv_candidate_pool,
         output_dir,
-        frames_per_candidate=max(6, min(12, args.frames_per_candidate)),
+        frames_per_candidate=frames_per_candidate,
     )
 
-    model_judgements, model_any_success, used_fallback, model_error = run_model_judgements(
-        model_input_packages,
-        endpoint=str(args.local_vlm_endpoint),
-        primary_model=str(args.local_vlm_model),
-        fallback_model=str(args.local_vlm_fallback_model),
-        timeout_seconds=int(args.local_vlm_timeout_seconds),
-        max_retries=int(args.local_vlm_max_retries),
-        temperature=float(args.local_vlm_temperature),
-    )
+    lock_root = run_dir.parents[2] if len(run_dir.parents) >= 3 else run_dir
+    lock_path = lock_root / ".local_vlm.lock"
+    with local_vlm_lock(lock_path):
+        model_judgements, model_any_success, used_fallback, model_error = run_model_judgements(
+            model_input_packages,
+            endpoint=str(args.local_vlm_endpoint),
+            primary_model=str(args.local_vlm_model),
+            fallback_model=str(args.local_vlm_fallback_model),
+            timeout_seconds=int(args.local_vlm_timeout_seconds),
+            max_retries=int(args.local_vlm_max_retries),
+            temperature=float(args.local_vlm_temperature),
+        )
 
     selected_clip_exports: list[dict[str, Any]] = []
     if not model_any_success and model_error:
@@ -2549,12 +2673,17 @@ def main() -> None:
         )
         if used_fallback and selection_result["selection_status"] == "ready":
             selection_result["selection_status"] = "model_degraded"
-        if not args.skip_export_clips and selection_result["selected_clips"]:
-            selected_clip_exports = export_selected_clips(selection_result["selected_clips"], selected_clips_dir)
+        should_promote = not args.skip_export_clips and not args.skip_promote_selected_clips
+        if should_promote and selection_result["selected_clips"]:
+            selected_clip_exports = export_selected_clips(
+                selection_result["selected_clips"],
+                selected_clips_dir,
+                selection_run_id=selection_run_id,
+            )
 
     finished_at = time.time()
     package = {
-        "selection_version": "v1.0.1-implementation-ready-local-vlm-rerank",
+        "selection_version": "v1.0.2-local-vlm-selection-recovery",
         "source_segmentation_run": {
             "run_dir": str(run_dir),
             "manifest_path": str(manifest_path),
@@ -2593,6 +2722,8 @@ def main() -> None:
         "infeasible_reasons": selection_result["infeasible_reasons"],
         "selected_clip_exports_dir": str(selected_clips_dir) if selected_clip_exports else None,
         "selected_clip_exports": selected_clip_exports,
+        "selected_clips_result_role": "final" if selected_clip_exports else "trial",
+        "promoted_selected_clips": bool(selected_clip_exports),
         "selection_notes": {
             "started_at_epoch": round(started_at, 3),
             "finished_at_epoch": round(finished_at, 3),

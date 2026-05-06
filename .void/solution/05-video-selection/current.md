@@ -18,6 +18,9 @@
 - [配置方案](../configuration.md)
 - [总体架构](../../blueprint/overall-architecture.md)
 - [视频精选 v1.0.1 实现规格补强验证](../../validation/2026-04-28-video-selection-v1.0.1-implementation-spec.md)
+- [视频精选 v1.0.2 本地 VLM 有效 selection 恢复验证](../../validation/2026-05-05-video-selection-v1.0.2-local-vlm-selection-recovery.md)
+- [视频精选 v1.0.3 单一最终输出目录验证](../../validation/2026-05-06-video-selection-v1.0.3-single-final-selected-clips.md)
+- [视频精选 v1.0.4 本地 VLM 串行稳定性验证](../../validation/2026-05-06-video-selection-v1.0.4-local-vlm-serial-stability.md)
 
 历史方案链路：
 - [视频精选方案历史（V1）](./history/v1.md)
@@ -26,13 +29,16 @@
 - [视频精选方案历史（V4）](./history/v4.md)
 - [视频精选方案历史（v0.4.0）](./history/v0.4.0.md)
 - [视频精选方案历史（v1.0.0）](./history/v1.0.0.md)
+- [视频精选方案历史（v1.0.2）](./history/v1.0.2.md)
+- [视频精选方案历史（v1.0.3）](./history/v1.0.3.md)
+- [视频精选方案历史（v1.0.4）](./history/v1.0.4.md)
 
 说明：
 - 当前方案是一次大规模重设计，用于代码实现时不以历史方案作为实现依据。
 - 历史方案仅用于追溯 selection 子域的演进、失败模式和版本替代关系。
 
 ## 当前生效版本
-当前生效版本为 `v1.0.1-implementation-ready-local-vlm-rerank`。
+当前生效版本为 `v1.0.4-local-vlm-serial-stability`。
 
 这是 `05 selection` 的当前主线：
 - `CV` 不再承担最终语义判断。
@@ -96,37 +102,65 @@ selection 的目标不是“找运动最强的片段”，而是“选出最值�
 - 专业级动作归因。
 - 输出最终训练建议。
 
-## v1.0.1 固定实现决策
+## v1.0.4 固定实现决策
 ### 本地模型运行时
-v1.0.1 第一版固定使用：
+v1.0.4 当前固定使用：
 - `provider = ollama`
 - `endpoint = http://localhost:11434/api/chat`
-- `model = qwen2.5vl:7b`
+- `model = qwen2.5vl:3b`
 - `fallback_model = qwen2.5vl:3b`
 - `temperature = 0`
-- `format = JSON Schema`
-- `timeout_seconds = 120`
+- `format = json`
+- `timeout_seconds = 180`
 - `max_retries = 1`
 
 选择理由：
 - `Ollama` 官方支持 vision model 的图像输入。
-- `Ollama` 官方支持 structured outputs。
 - `qwen2.5vl` 在 Ollama library 中提供 `3b / 7b / 32b / 72b` 版本，并支持 `Text, Image` 输入。
 - 关键帧序列输入比直接视频输入更稳定，也更符合 Ollama vision API 的工程形态。
+- 当前机器上 `3b + 少量候选 + 少量关键帧` 已验证可以稳定返回有效 judgement，比 `7b` 作为主路径更务实。
+- 默认 fallback 不再切到 `7b`，避免一次失败重试直接把本地负载抬高。
+
+### 本地运行时保护
+v1.0.4 新增两层保护：
+
+- 全局本地 VLM 锁
+  - 同一时间只允许一个 selection run 进入本地模型判断阶段
+  - 防止多个视频 run 并发争抢同一个 Ollama 实例
+- 调用前 preflight
+  - 在真正发起模型请求前检查 `ollama ps`
+  - 如果存在残留模型任务，先尝试清理，再等待 Ollama 回到空闲状态
+  - 若在等待窗口内仍无法空闲，则本轮直接失败，不带着脏状态继续跑
+
+### 输出目录语义
+`selection_runs/` 与 `selected_clips/` 的职责必须分离：
+
+- `selection_runs/<selection_run_id>/`
+  - 保存一次 selection run 的完整审计记录
+  - 允许多次并存
+  - 允许失败、实验性结果和重复片段
+- `selected_clips/`
+  - 只保存当前被提升为最终结果的一组视频切片
+  - 目录下不再按多个 `selection_run_id` 并列保留
+  - 每次成功 promotion 时整体覆盖
+
+实现约束：
+- 默认情况下，成功 run 会覆盖 `<run-dir>/selected_clips/`。
+- 如果只是实验 run，不希望覆盖最终结果，必须显式传 `--skip-promote-selected-clips`。
+- `selected_clips/manifest.json` 必须记录当前最终结果来自哪个 `selection_run_id`。
 
 明确暂缓：
 - `MLX/VLM` 不作为 v1.0.1 必需实现路径，只保留为后续 `local_vlm_runner` adapter。
 - 不在 v1.0.1 中实现云端模型 fallback。
 
 ### 模型输入形态
-v1.0.1 不把视频文件直接传给模型。
+v1.0.4 不把视频文件直接传给模型。
 
 每个候选传入：
-- `6-12` 张 JPEG 关键帧，默认 `9` 张。
+- `1-12` 张 JPEG 关键帧，默认 `2` 张。
 - 候选元数据。
 - CV 证据摘要。
-- 固定 prompt。
-- JSON Schema。
+- 固定 prompt，其中显式写出目标 JSON 结构与枚举。
 
 关键帧必须覆盖：
 - 候选开头。
@@ -140,9 +174,15 @@ v1.0.1 不把视频文件直接传给模型。
 请求必须满足：
 - `stream = false`
 - `options.temperature = 0`
-- `format = model_judgement_schema`
+- `format = json`
 - `messages[0].images` 使用 base64 JPEG 列表
-- prompt 中同时嵌入简短 schema 说明，避免模型忽略结构约束
+- prompt 中显式嵌入字段、枚举和值域约束
+
+实现约束补充：
+- `candidate_pool_size` 和 `frames_per_candidate` 必须真实按输入参数生效，只允许做安全上界/下界钳制，不允许偷偷抬高到固定最小值。
+- 模型原始响应必须落盘，哪怕后续 JSON 解析或字段校验失败。
+- 如果整轮没有任何合法 `model_judgement`，即使生成了 fallback judgement，也必须输出 `selection_status = model_unavailable`，不能继续产生伪成功的 `selected_clips`。
+- 本地模型判断阶段必须串行执行，不允许多个 selection run 并发打同一 Ollama 实例。
 
 如果请求超时、连接失败、模型不存在或返回非 2xx：
 - 若当前模型不是 fallback，则尝试 `fallback_model`。
@@ -168,15 +208,15 @@ v1.0.1 不把视频文件直接传给模型。
 - `handedness = right / left / unknown`
 - `serve_presence = auto / present / absent`
 - `selection_focus: string[]`
-- `candidate_pool_size: number`，默认 `18`
-- `selected_size: number`，默认 `6`
-- `frames_per_candidate: number`，默认 `9`
+- `candidate_pool_size: number`，默认 `4`
+- `selected_size: number`，默认 `3`
+- `frames_per_candidate: number`，默认 `2`
 
 ### 输出
 05 输出 `selection_package`。
 
 顶层字段：
-- `selection_version: "v1.0.1-implementation-ready-local-vlm-rerank"`
+- `selection_version: "v1.0.3-single-final-selected-clips"`
 - `source_segmentation_run: object`
 - `selection_run_id: string`
 - `params: object`
@@ -190,6 +230,8 @@ v1.0.1 不把视频文件直接传给模型。
 - `infeasible_reasons: string[]`
 - `selected_clip_exports_dir: string | null`
 - `selected_clip_exports: object[]`
+- `selected_clips_result_role: "final" | "trial"`
+- `promoted_selected_clips: boolean`
 - `selection_notes: object`
 
 `selection_status` 枚举：

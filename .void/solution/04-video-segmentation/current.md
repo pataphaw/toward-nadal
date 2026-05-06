@@ -1,7 +1,7 @@
 # 视频切片架构（Current）
 
 ## 文档定位
-本文档定义视频切片子域当前生效的方案版本，并将其作为 `V1.1-segment-stable-beta` 的阶段性里程碑文档。
+本文档定义视频切片子域当前生效的方案版本，并将其作为 `V1.2-confirmed-boundary-selection-recovery` 的阶段性里程碑文档。
 
 它回答的是：
 - 当前生效的事实是什么。
@@ -11,11 +11,13 @@
 
 相关文档：
 - 历史方案：[视频切片方案历史（V1）](./history/v1.md)
-- 阶段快照：[视频切片阶段快照（V1.1-segment-stable-beta）](./history/v1.1-segment-stable-beta.md)
+- 上一阶段快照：[视频切片阶段快照（V1.1-segment-stable-beta）](./history/v1.1-segment-stable-beta.md)
+- 当前阶段快照：[视频切片阶段快照（V1.2-confirmed-boundary-selection-recovery）](./history/v1.2-confirmed-boundary-selection-recovery.md)
+- 设计验证：[2026-05-04-video-segmentation-confirmed-boundary-selection-recovery](../../validation/2026-05-04-video-segmentation-confirmed-boundary-selection-recovery.md)
 - 验证索引：[视频切片 V1 验证索引](../../validation/video-segmentation-v1-validation-index.md)
 
 ## 当前生效事实
-当前生效版本为 `V1.1-segment-stable-beta`。
+当前生效版本为 `V1.2-confirmed-boundary-selection-recovery`。
 
 当前实现入口：
 - [tools/segment_video.py](/Users/pataphaw/Projects/toward-nadal/tools/segment_video.py:1)
@@ -27,9 +29,9 @@
 - 采用 `point-first` 路线，先把回合主片段做稳，再补齐 `break` 与完整时间轴。
 
 当前阶段的里程碑结论是：
-- 该版本已经形成可重复执行、可验证、可继续迭代的本地切片闭环。
-- 当前可用性主要建立在“优先保护回合完整性”，而不是“已经把边界切得足够干净”。
-- 用户复核结论为“整体明显改善，但仍存在少量结尾提前截断”，因此该版本标记为阶段性稳定版并暂时冻结优化。
+- 该版本继续保持可重复执行、可验证、可继续迭代的本地切片闭环。
+- 当前修复重点是恢复 05 selection 的可消费性，而不是继续追求更激进的边界收紧。
+- 静音锚点现在只作为辅助证据，不再作为 `confirmed` 的硬前提。
 
 ## 子域职责与非目标
 视频切片层的职责，是把单个长视频转换成一组按时间顺序组织、可被后续精选和分析消费的片段。
@@ -217,10 +219,9 @@
 - `point_clips`
 - `compact_clips`
 - `logs`
-- `rederived`
 
 其中当前状态是：
-- `point_clips` 为主产物。
+- `point_clips` 为唯一主产物。
 - `compact_clips` 固定为空数组，仅作为兼容占位。
 
 ### `point clip`
@@ -241,18 +242,23 @@
 当前 `boundary_evidence` 记录的是实现层证据，而不是高层语义标签。
 
 至少包含：
+- `supporting_silence_before`
+- `supporting_silence_after`
+- `start_anchor`
+- `end_anchor`
+- `anchor_summary`
+- `boundary_status`
+- `uncertain_reason`
 - `duration_flag`
-- `evidence_sources`
-- `source_intervals`
 
 ## 当前默认参数
 参数当前全部硬编码在脚本的 `DEFAULT_PARAMS` 中，尚未外置。
 
 ### 音频窗口相关
 - `window_seconds = 0.4`
-- `active_gap_seconds = 0.6`
+- `active_gap_seconds = 1.2`
 - `min_active_span_seconds = 2.0`
-- `rms_threshold_dbfs = -32.8`
+- `rms_threshold_dbfs` 为按素材自适应计算，不再在方案层写死单值
 
 ### 运动提取相关
 - `motion_fps = 2.0`

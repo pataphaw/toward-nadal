@@ -15,13 +15,14 @@ clips_dir = "/absolute/path/to/working/clips"
 
 [selection]
 # Number of CV-generated candidates to send into local vision-model reranking.
-candidate_pool_size = 18
+candidate_pool_size = 4
 
 # Target number of representative clips selected for downstream analysis.
-selected_size = 6
+# This is the config-side control for the final selected_count.
+selected_size = 3
 
 # Number of ordered JPEG keyframes passed to the local vision model per candidate.
-frames_per_candidate = 9
+frames_per_candidate = 2
 
 [selection.local_vlm]
 # v1.0.1 supports Ollama as the first local VLM runner.
@@ -31,9 +32,9 @@ provider = "ollama"
 endpoint = "http://localhost:11434/api/chat"
 
 # Main local vision-language model.
-model = "qwen2.5vl:7b"
+model = "qwen2.5vl:3b"
 
-# Lower-resource fallback model when the main model is unavailable.
+# Keep fallback equal to the primary model by default to avoid loading a second heavier model.
 fallback_model = "qwen2.5vl:3b"
 
 # Request timeout for one candidate judgement.
@@ -44,3 +45,29 @@ max_retries = 1
 
 # Keep deterministic for schema-constrained model judgements.
 temperature = 0
+
+[analysis]
+# Number of evenly sampled frames extracted from each selected clip.
+frames_per_clip = 6
+
+# Upper bound for concatenated memory markdown content sent into the model.
+max_memory_chars = 32000
+
+[analysis.openrouter]
+# Current v1 analysis path uses OpenRouter plus Gemini 2.5 Flash keyframe analysis.
+model = "google/gemini-2.5-flash"
+
+# Fallback model when Flash is unavailable or returns an unusable result.
+fallback_model = "google/gemini-2.5-pro"
+
+# Environment variable that stores the API key.
+api_key_env_var = "OPENROUTER_API_KEY"
+
+# API endpoint for OpenRouter chat completions.
+api_base = "https://openrouter.ai/api/v1/chat/completions"
+
+# Request timeout for one analysis run.
+timeout_seconds = 180
+
+# Image detail level for keyframes: low, high, or auto.
+image_detail = "low"
