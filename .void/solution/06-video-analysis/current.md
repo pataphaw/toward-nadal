@@ -1,170 +1,251 @@
 # 视频分析架构（Current）
 
+## 文档定位
+本文档定义视频分析子域当前生效方案。
+
+当前版本不是一次性脚本说明，而是 `06-video-analysis` 的最小可用正式闭环。  
+它的目标是在满足当前明确需求的前提下，先建立一条可稳定复用的分析链路；不提前为未来场景引入尚未被需求证明的复杂性。
+
+相关文档：
+- [视频精选架构（Current）](../05-video-selection/current.md)
+- [结果保存架构（Current）](../07-result-persistence/current.md)
+- [配置方案](../configuration.md)
+- [总体架构](../../blueprint/overall-architecture.md)
+
+## 当前生效版本
+当前生效版本为 `v1.0.0-minimal-openrouter-gemini-keyframe`。
+
+它的核心判断如下：
+- 初版要建立正式闭环，而不是临时跑通一次分析。
+- 初版先固定一条最短可用路径，不提前做多 provider 抽象。
+- 初版直接消费 05 已导出的分析视频，不重复做 selection 发现与重组。
+- 初版直接读取 Obsidian 记忆目录中的现有文档，不提前实现复杂检索层。
+
 ## 目标与边界
-本子域负责把精选后的网球视频片段转成可复盘、可追踪、可复用的分析结果。
+本子域负责：
+- 读取一次 `selection-package.json` 对应的 `selected_clips`
+- 从每个已导出的视频切片中抽取关键帧
+- 结合当前记忆目录中的 Markdown 文档构造分析输入
+- 调用外部模型完成网球技术分析
+- 输出结构化分析结果与可读摘要
 
-边界如下：
-- 输入是“已筛选的视频片段 + 结构化上下文”
-- 输出是“结构化分析结论 + 可追溯证据”
-- 不负责原始视频同步、切片或精选
-- 不负责训练计划执行，只输出下次训练可用的重点
+本子域不负责：
+- 原始视频同步、切片与精选
+- 自动发现最新 selection 结果
+- 复杂记忆检索、向量索引或语义召回
+- 训练计划执行
+- 正式写回 Obsidian session note
 
-核心判断不变：
-- 不把整段长视频和全部历史笔记直接扔给模型
-- 不把自然语言点评当作最终产物
-- 不把视频分析和上下文检索混为一个步骤
+## 当前主路径
+初版固定采用：
+- `05 selection` 导出的短视频切片
+- 关键帧序列
+- OpenRouter
+- `Gemini 2.5 Flash`
+- 结构化 JSON 输出
 
-## 输入与输出
-### 输入
-分析层的标准输入由三部分组成：
-- `selected_clips`：精选后的样本列表，至少带 `clip_id`、来源视频、`focus_window`、`export_window`、`model_judgement`、`cv_evidence`、入选理由、覆盖角色与 `needs_review`
-- `context_pack`：从记忆中检索出的结构化上下文
-- `task_spec`：本次分析目标，例如技术复盘、问题定位、训练重点确认
+当前不实现：
+- 原生视频直传分析
+- 多模型 provider 切换
+- 云端与本地多路径自动降级
 
-`selected_clips` 来自 05 selection v1.0.1 时，分析层应识别以下字段：
-- `export_window`：实际导出给分析模型观看的视频窗口。
-- `focus_window`：候选内部最值得关注的分析焦点，兼容旧命名。
-- `model_judgement`：05 本地视觉模型对候选是否 in-play、是否完整、动作与价值标签的判断。
-- `cv_evidence`：05 生成候选时的运动、质量和边界证据。
-- `semantic_tags`：由 `model_judgement` 派生的兼容字段。
+说明：
+- 未来仍保留“直接传视频分析”的升级方向。
+- 但在当前版本中，这只是后续演进方向，不进入实现主线。
 
-### 输出
-输出应满足两类用途：
-- 人读：能直接看出这次训练的结论、问题和下一步动作
-- 机读：能被后续检索、对比、汇总和生成下一次 prompt 使用
+### 当前模型选择
+- 主模型：`Gemini 2.5 Flash`
+- 备选模型：`Gemini 2.5 Pro`
 
-推荐输出字段保持稳定：
+原因只保留三点：
+- 你的场景是网球视频/图片分析，Gemini 系列对多模态理解更贴近后续“直接传视频”的主方向。
+- `Gemini 2.5 Flash` 的效果与成本更平衡，适合先作为默认工作模型。
+- `Gemini 2.5 Pro` 成本更高，但在复杂判断和疑难片段上更适合作为保守备选。
+
+## 输入契约
+### CLI 输入
+初版 CLI 只支持两个参数：
+- `--selection-package <path>`
+- `--config <path>`
+
+调用方必须显式提供目标 `selection-package.json` 路径。  
+当前版本不负责从 `.work` 目录中自动发现“最新可分析 run”。
+
+### 上游输入
+分析层当前直接消费 05 的 `selection-package.json`。
+
+只要满足以下条件，就进入分析：
+- `selected_clips` 非空
+- 每个待分析条目存在 `exported_clip_path`
+- `exported_clip_path` 指向的视频文件存在
+
+当前版本至少识别以下字段：
+- `selection_id`
+- `clip_id`
+- `source_video_id`
+- `exported_clip_path`
+- `focus_window`
+- `export_window`
+- `coverage_roles`
+- `model_judgement`
+- `cv_evidence`
+
+其中：
+- `exported_clip_path` 是当前主观看对象。
+- `export_window` 表示实际上游导出的观看区间。
+- `focus_window` 表示片段内更值得关注的技术焦点。
+- `model_judgement` 与 `cv_evidence` 只作为 selection 证据，不作为最终技术诊断。
+
+## 记忆输入策略
+当前版本不单独实现复杂记忆子系统。
+
+记忆直接来自：
+- `config.toml`
+- `memory.obsidian_vault_dir`
+
+分析前直接读取该目录下全部 `.md` 文档，并将其作为附加上下文输入模型。
+
+当前策略固定为：
+- 保留文档相对路径
+- 保留文档标题或文件名
+- 保留文档全文
+- 按路径顺序拼接
+
+若上下文超过输入预算，只做最小裁剪：
+- 优先保留 `00_Profile/`
+- 其余文档按路径顺序截断
+
+当前不做：
+- embedding
+- rerank
+- 主题过滤
+- 冲突消解
+- 独立 `context_pack` 子系统
+
+如果后续验证表明记忆长度、噪声或组织方式开始稳定影响分析质量，再把这部分升级为单独方案。
+
+## 分析链路
+当前分析链路固定为：
+1. 读取 `selection-package.json`
+2. 提取 `selected_clips`
+3. 打开每个 `exported_clip_path`
+4. 从每个视频均匀抽取固定数量关键帧
+5. 读取 Obsidian 记忆目录中的 Markdown 文档
+6. 组装固定 prompt
+7. 通过 OpenRouter 调用 `Gemini 2.5 Flash`，必要时回退到 `Gemini 2.5 Pro`
+8. 校验输出结构
+9. 写出结构化结果与可读摘要
+
+当前链路的重点是先把“精选片段 -> 结构化技术分析”这条路径跑稳。  
+凡是不直接影响这条主路径成立的复杂性，都不在初版中引入。
+
+## Prompt 约束
+当前 prompt 目标是固定任务边界，而不是追求高度灵活。
+
+建议固定包含以下区块：
+1. `角色与任务`
+2. `分析规则`
+3. `历史记忆`
+4. `视频片段清单`
+5. `输出合同`
+
+其中分析规则至少要求模型：
+- 只基于视频证据和给定上下文判断
+- 区分 `observed`、`inferred`、`uncertain`
+- 不把 selection 的中间判断直接当作最终技术结论
+
+## 输出契约
+当前版本输出两类结果：
+- 机读结果：`analysis-result.json`
+- 人读结果：`analysis-report.md`
+
+`analysis-result.json` 至少包含：
 - `session_summary`
+- `goal_assessment`
+- `state_assessment`
 - `top_findings[]`
 - `priority_actions[]`
+- `keep_doing[]`
 - `clip_notes[]`
-- `traceability`
 - `open_questions[]`
 - `next_session_focus`
 
-每条结论都应带最少三项标记：
+这组字段直接覆盖当前明确需求：
+- 当前技术、训练和核心目标，以及当天达成度
+- 当天状态的整体判断
+- 当天的主要问题与后续改进方案
+- 当天发挥好的方面与后续保持方式
+
+每条关键结论至少应带：
 - `status`
 - `confidence`
 - `evidence`
 
-## 分析编排层
-分析编排层负责把“片段、上下文、模型调用、结果落盘”串成一次 session。
+`analysis-report.md` 的职责只是把结构化结果转成便于阅读的摘要。  
+正式事实源仍应以 `analysis-result.json` 为准。
 
-推荐流程：
-1. 读取本次训练的 `selected_clips`
-2. 汇总可用的长期、中期、短期上下文
-3. 按模型能力选择输入形态，并优先消费 `export_window` 对应导出视频，同时在 prompt 中标注 `focus_window`
-4. 组装 prompt 并发起分析
-5. 校验输出 schema
-6. 写回 Obsidian 目标路径
+## 输出位置
+当前版本把结果写入 `.work`，不直接写回 Obsidian。
 
-这一层的职责是编排，不是推理本身。凡是会影响 prompt 内容的判断，都应先在这一层完成裁剪和选择。
+推荐输出目录位于对应 selection run 下，例如：
+- `selection_runs/<selection-run-id>/analysis_runs/<analysis-run-id>/`
 
-## 上下文检索层
-上下文检索的目标是提供“刚好够用”的背景，而不是塞满历史。
+当前版本最少写出：
+- `analysis-result.json`
+- `analysis-report.md`
 
-### 分层策略
-- 长期上下文：稳定事实，如打法、惯用手、长期伤病、长期目标
-- 中期上下文：最近 `2-6` 周的训练和复盘，如重复暴露的问题、已验证有效的修正
-- 短期上下文：当前 session 相关信息，如疲劳、场地、对手类型、训练或比赛背景
+当前不要求额外生成：
+- `context-pack.json`
+- `analysis-prompt.json`
+- `traceability.json`
 
-### 检索原则
-- 先做主题过滤，再做语义检索
-- 只保留会改变本次分析判断的内容
-- 历史笔记冲突时，优先保留最近且证据更明确的一条
-- 冲突本身也要显式标记，不能静默吞掉
+若后续排障或复用需要，再补充这些中间产物。
 
-### 裁剪原则
-- 稳定事实优先
-- 近期事实优先
-- 与当前分析无关的背景一律下沉或丢弃
+## 配置要求
+当前版本除已有配置外，还需要最小分析配置。
 
-## Prompt 装配层
-Prompt 的目标是把任务边界、上下文和输出合同固定下来。
+建议新增：
+- `[analysis]`
+- `[analysis.openrouter]`
 
-建议固定为 5 个区块：
-1. `角色与任务`：明确模型身份，例如网球技术分析教练、训练复盘分析师
-2. `分析规则`：只基于证据和上下文，区分 `observed`、`inferred`、`uncertain`
-3. `用户上下文包`：只放会影响判断的稳定和近期信息
-4. `视频清单`：每个片段都带稳定引用
-   若上游提供 `export_window` 与 `focus_window`，这里应把 `export_window` 作为观看范围，把 `focus_window` 作为重点观察范围
-5. `输出合同`：要求按固定 schema 输出
+至少应支持：
+- 分析模型名
+- 备选模型名
+- API key 的环境变量名
+- 单次调用超时
+- 每个片段抽取的关键帧数量
 
-装配时要遵守两条原则：
-- 固定前缀尽量稳定，减少每次分析的格式漂移
-- 不把细节写散在正文里，所有可复用约束都应进入固定块
+当前约束如下：
+- `config.toml` 必须是合法 TOML
+- `memory.obsidian_vault_dir` 必须存在
+- 分析所需 API key 必须可读取
 
-## 输出契约
-输出契约的目标是让结果可以被后续流程继续消费。
+## 失败策略
+当前版本只处理最关键的失败场景，并明确失败，不做复杂自动修复。
 
-建议采用“结构化结果 + 简短自然语言摘要”的双层输出：
-- 结构化结果用于检索、对比、自动化
-- 简短摘要用于人读和快速复盘
+应直接失败的情况：
+- `selected_clips` 为空
+- `exported_clip_path` 不存在
+- 无法读取记忆目录
+- 配置缺失
+- 模型返回的 JSON 不满足输出契约
 
-结构化结果至少应支持：
-- 本次训练的一句话结论
-- 主要问题点
-- 主要改进动作
-- 每个片段的关键观察
-- 证据来源和追溯路径
-- 未解决问题
-- 下次训练关注点
+当前不采用的降级方式：
+- 自动回退到其他 provider
+- 退化为自由文本散文输出
+- 跳过结构校验直接落盘
 
-如果结构校验失败，结果不应直接落盘为正式结论，只能进入待复核状态。
+## 风险与后续演进
+### 当前主要风险
+- 关键帧可能丢失连续动作细节
+- 全量记忆文档可能引入噪声
+- 输出 schema 过弱会影响后续复用
 
-## 模型适配策略
-当前工程判断仍然是：
-- 若要直接分析视频片段，优先选择公开支持视频输入的平台
-- 若使用主要支持图像输入的平台，则改成“关键帧序列 + 文本上下文”的路径
+### 明确保留的后续方向
+- 直接视频输入分析
+- selection package 自动发现
+- 记忆检索与裁剪优化
+- 与 `07-result-persistence` 的正式衔接
 
-这里的判断是基于公开文档的能力边界，不是未来能力的断言。
-
-### 直接视频路径
-适合公开支持原生视频输入、时间戳引用和采样控制的模型。
-
-### 关键帧路径
-适合以图像输入为主的模型：
-- 从片段中抽取关键帧
-- 保留时间顺序
-- 结合结构化上下文分析
-
-### 适配原则
-- 模型能力先决定输入形态
-- 不要为了统一而牺牲有效信息
-- 同一套输出契约保持不变，便于横向替换模型
-- 05 的 `model_judgement` 是 selection 证据，不是最终技术诊断；06 可以引用它的不确定性，但不能把它当作最终结论
-
-## 降级路径
-当主路径不可用时，优先降级输入，而不是放宽输出要求。
-
-可用降级路径：
-- 视频直传失败时，退回到关键帧分析
-- 上下文过长时，保留稳定事实和最近一次复盘
-- 模型不稳定时，增加二次复核步骤
-- 结构化输出失败时，先修复 schema，再生成正式结果
-
-不建议的降级方式：
-- 直接把约束放松成自由散文
-- 直接减少证据要求
-- 直接把历史上下文全量塞回去
-
-## 风险与观察
-### 主要风险
-- 低采样率会丢失挥拍和脚步细节
-- 上下文过多会污染判断
-- 历史结论冲突会误导模型
-- 只输出自然语言会让后续追踪变差
-
-### 观察点
-- 哪类上下文最常被保留但实际无贡献
-- 哪类片段最能推动结论变化
-- 哪些输出字段最常被后续消费
-- 结构化输出失败是格式问题还是内容问题
-
-## 参考资料
-- Gemini API, Video understanding: https://ai.google.dev/gemini-api/docs/video-understanding
-- Gemini API, Prompting strategies: https://ai.google.dev/gemini-api/docs/prompting-strategies
-- Gemini API, Structured output: https://ai.google.dev/gemini-api/docs/structured-output
-- OpenAI API, Images and vision: https://platform.openai.com/docs/guides/images-vision
-- OpenAI API, Structured outputs: https://platform.openai.com/docs/guides/structured-outputs
-- Anthropic, Vision: https://docs.anthropic.com/en/docs/build-with-claude/vision
+这些方向都是真实演进方向，但当前版本不提前实现。  
+只有当验证明确暴露出瓶颈时，再把对应部分升级为更复杂的独立方案。
