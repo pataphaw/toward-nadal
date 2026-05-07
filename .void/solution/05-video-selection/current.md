@@ -337,6 +337,10 @@ v1.0.4 不把视频文件直接传给模型。
 - `selection_runs/<selection_run_id>/model_inputs/<candidate_id>/model_response.json`
 - `selection_runs/<selection_run_id>/model_inputs/<candidate_id>/judgement.json`
 
+说明：
+- 仓库级 `prompts/selection/...` 是稳定模板源。
+- run 目录内的 `prompt.txt` 是本次实际发送给模型的 prompt 快照，便于审计。
+
 缓存规则：
 - 如果 `judgement.json` 存在且 `input.json` 中的 `input_hash` 一致，可以复用模型结果。
 - 如果 prompt、schema、候选窗口或帧内容变化，必须重新调用模型。
@@ -403,6 +407,14 @@ v1.0.4 不把视频文件直接传给模型。
 
 ## 模型 prompt
 每个候选使用固定任务 prompt。
+
+运行时模板事实源位于仓库级目录：
+- `prompts/selection/model-judgement-user.txt`
+- `prompts/selection/model-judgement-user-scaffold.txt`
+
+其中：
+- `model-judgement-user.txt` 保存稳定任务说明。
+- `model-judgement-user-scaffold.txt` 保存运行时 user prompt 骨架，代码只注入候选 JSON 等动态块。
 
 模板：
 

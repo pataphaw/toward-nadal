@@ -1,0 +1,6 @@
+{{task_prompt}}
+
+候选元数据与 CV 证据：
+{{candidate_payload_json}}
+
+请返回严格 JSON。
