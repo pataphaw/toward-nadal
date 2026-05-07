@@ -29,27 +29,29 @@ DEFAULTS = {
     "api_base": "https://generativelanguage.googleapis.com/v1beta",
     "api_key_env_var": "GEMINI_API_KEY",
     "max_memory_chars": 32000,
+    "context_mode": "minimal_profile",
+    "system_prompt_path": "prompts/analysis/technique-review-system.txt",
+    "user_scaffold_path": "prompts/analysis/technique-review-user-scaffold.txt",
 }
 
-SYSTEM_PROMPT = """你是网球技术分析教练。
+CONTEXT_MODES = {"minimal_profile", "full_memory"}
 
-你会收到：
-1. 一组按时间顺序排列的训练视频关键帧。
-2. 每个片段的基础元数据与 selection 证据。
-3. 用户现有的网球长期/近期记忆文档。
+MINIMAL_PROFILE_LINES = [
+    "年龄：将近 33 岁",
+    "身高：191 cm",
+    "体重：约 80 kg",
+    "网球水平：NTRP 2.5 / UTR 2.18",
+]
 
-请输出结构化 JSON，用于训练复盘。
-
-分析规则：
-- 只根据提供的视频证据和上下文做判断。
-- 明确区分 observed、inferred、uncertain。
-- selection 阶段的 model_judgement 和 cv_evidence 只是辅助证据，不是最终技术结论。
-- 历史记忆文档只能作为背景上下文，不能单独支撑任何技术判断。
-- 每一处观点都必须绑定到至少一个具体视频片段，必须给出 selection_id、clip_id、time_range 和具体观察。
-- 如果某个观点找不到对应的视频片段证据，就不要输出这个观点。
-- 不要输出泛泛鼓励，不要空泛鸡汤。
-- 如果证据不足，明确写 uncertain 或放入 open_questions。
-"""
+MINIMAL_CONTEXT_BANNED_MARKERS = [
+    "00_Profile/",
+    "10_Matches/",
+    "20_Trains/",
+    "profile.md",
+    "历史记忆",
+    "记忆文档",
+    "长期画像",
+]
 
 VIDEO_EVIDENCE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -264,6 +266,24 @@ def nested_get(config: dict[str, Any], *keys: str, default: Any = None) -> Any:
     return current
 
 
+def repo_root() -> pathlib.Path:
+    return pathlib.Path(__file__).resolve().parent.parent
+
+
+def load_prompt_text(relative_path: str) -> str:
+    path = repo_root() / relative_path
+    if not path.exists():
+        raise SystemExit(f"Missing prompt file: {path}")
+    return path.read_text(encoding="utf-8")
+
+
+def render_prompt_scaffold(scaffold: str, replacements: dict[str, str]) -> str:
+    rendered = scaffold
+    for key, value in replacements.items():
+        rendered = rendered.replace(f"{{{{{key}}}}}", value)
+    return rendered
+
+
 def ffprobe_duration(video_path: pathlib.Path) -> float:
     data = json.loads(
         run_command(
@@ -312,8 +332,38 @@ def selection_reference(item: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def selection_index(selected_clips: list[dict[str, Any]]) -> dict[str, dict[str, str]]:
-    return {ref["selection_id"]: ref for ref in (selection_reference(item) for item in selected_clips)}
+def parse_timecode(value: str) -> float:
+    try:
+        hhmmss, millis = value.split(".", 1)
+        hours, minutes, seconds = hhmmss.split(":")
+        return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(millis) / 1000.0
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid timecode: {value}") from exc
+
+
+def parse_time_range(value: str) -> tuple[float, float]:
+    try:
+        start_text, end_text = value.split("-", 1)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid time_range: {value}") from exc
+    start = parse_timecode(start_text)
+    end = parse_timecode(end_text)
+    if end <= start:
+        raise RuntimeError(f"Invalid time_range: start must be before end: {value}")
+    return start, end
+
+
+def selection_index(selected_clips: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    indexed: dict[str, dict[str, Any]] = {}
+    for item in selected_clips:
+        reference = selection_reference(item)
+        range_start, range_end = parse_time_range(reference["time_range"])
+        indexed[reference["selection_id"]] = {
+            **reference,
+            "range_start": range_start,
+            "range_end": range_end,
+        }
+    return indexed
 
 
 def build_frame_timestamps(duration: float, frame_count: int) -> list[float]:
@@ -408,38 +458,48 @@ def load_memory_documents(memory_root: pathlib.Path, max_memory_chars: int) -> l
     return kept
 
 
-def build_user_text(selected_clips: list[dict[str, Any]], memory_docs: list[dict[str, str]]) -> str:
-    parts: list[str] = []
-    parts.append("任务：请基于以下训练片段，输出当天网球技术复盘。")
-    parts.append("必须覆盖：")
-    parts.append("1. 当前网球技术、训练和核心目标，以及当天达成度。")
-    parts.append("2. 当天状态的整体判断，包括发挥好的技术特点和差的技术特点。")
-    parts.append("3. 当天的主要问题，以及后续改进方案。")
-    parts.append("4. 当天发挥好的方面，以及后续如何继续保持。")
-    parts.append("5. 每一条结论都必须绑定到具体视频片段，禁止只引用历史文档。")
-    parts.append("")
-    parts.append("视频证据输出强约束：")
-    parts.append("1. 任何分析观点都必须至少带一条 video_evidence。")
-    parts.append("2. video_evidence.selection_id / clip_id / time_range 必须原样抄写自下方片段 reference。")
-    parts.append("3. observation 必须描述该片段里实际看到的动作、站位、击球或结果，不能写抽象总结。")
-    parts.append("4. 如果没有具体片段证据，就不要输出该观点。")
-    parts.append("")
-    parts.append("历史记忆文档如下：")
+def build_user_text(
+    selected_clips: list[dict[str, Any]],
+    memory_docs: list[dict[str, str]],
+    *,
+    scaffold: str,
+    context_mode: str,
+) -> str:
+    memory_parts: list[str] = []
     for doc in memory_docs:
-        parts.append(f"## {doc['relative_path']}")
-        parts.append(doc["content"])
-        parts.append("")
-    parts.append("视频片段元数据如下：")
+        memory_parts.append(f"## {doc['relative_path']}")
+        memory_parts.append(doc["content"])
+        memory_parts.append("")
+    if context_mode == "full_memory":
+        analysis_context_block = "\n".join(
+            [
+                "## 最小个人信息",
+                "\n".join(f"- {line}" for line in MINIMAL_PROFILE_LINES),
+                "",
+                "## 历史记忆文档",
+                "\n".join(memory_parts).rstrip(),
+            ]
+        ).rstrip()
+    else:
+        analysis_context_block = "\n".join(
+            [
+                "## 最小个人信息",
+                "\n".join(f"- {line}" for line in MINIMAL_PROFILE_LINES),
+                "",
+                "除以上四项基本信息外，本次 analysis 不提供任何历史记忆、长期画像、训练记录或比赛复盘。",
+            ]
+        )
+    clip_parts: list[str] = []
     for item in selected_clips:
-        parts.append(f"### {item['selection_id']}")
-        parts.append(
+        clip_parts.append(f"### {item['selection_id']}")
+        clip_parts.append(
             json.dumps(
                 {"reference": selection_reference(item)},
                 ensure_ascii=False,
                 indent=2,
             )
         )
-        parts.append(
+        clip_parts.append(
             json.dumps(
                 {
                     "selection_id": item.get("selection_id"),
@@ -447,16 +507,20 @@ def build_user_text(selected_clips: list[dict[str, Any]], memory_docs: list[dict
                     "source_video_id": item.get("source_video_id"),
                     "focus_window": item.get("focus_window"),
                     "export_window": item.get("export_window"),
-                    "coverage_roles": item.get("coverage_roles"),
-                    "model_judgement": item.get("model_judgement"),
-                    "cv_evidence": item.get("cv_evidence"),
                 },
                 ensure_ascii=False,
                 indent=2,
             )
         )
-        parts.append("")
-    return "\n".join(parts)
+        clip_parts.append("")
+    return render_prompt_scaffold(
+        scaffold,
+        {
+            "context_mode": context_mode,
+            "analysis_context_block": analysis_context_block,
+            "selected_clips_block": "\n".join(clip_parts).rstrip(),
+        },
+    )
 
 
 def build_user_content(
@@ -502,12 +566,13 @@ def call_openrouter(
     api_key: str,
     model: str,
     timeout_seconds: int,
+    system_prompt: str,
     user_content: list[dict[str, Any]],
 ) -> dict[str, Any]:
     body = {
         "model": model,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
         "response_format": {
@@ -572,10 +637,11 @@ def call_gemini_api(
     api_key: str,
     model: str,
     timeout_seconds: int,
+    system_prompt: str,
     user_content: list[dict[str, Any]],
 ) -> dict[str, Any]:
     body = {
-        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": [
             {
                 "role": "user",
@@ -631,6 +697,7 @@ def call_model_with_fallback(
     primary_model: str,
     fallback_model: str | None,
     timeout_seconds: int,
+    system_prompt: str,
     user_content: list[dict[str, Any]],
 ) -> tuple[dict[str, Any], str, str]:
     call_fn = call_gemini_api if is_gemini_api_base(api_base) else call_openrouter
@@ -642,6 +709,7 @@ def call_model_with_fallback(
                 api_key=api_key,
                 model=primary_model,
                 timeout_seconds=timeout_seconds,
+                system_prompt=system_prompt,
                 user_content=user_content,
             ),
             primary_model,
@@ -656,6 +724,7 @@ def call_model_with_fallback(
                 api_key=api_key,
                 model=fallback_model,
                 timeout_seconds=timeout_seconds,
+                system_prompt=system_prompt,
                 user_content=user_content,
             ),
             fallback_model,
@@ -686,7 +755,7 @@ def ensure_analysis_shape(payload: dict[str, Any]) -> None:
 
 def validate_video_evidence_items(
     items: list[dict[str, Any]],
-    selected_index: dict[str, dict[str, str]],
+    selected_index: dict[str, dict[str, Any]],
     *,
     field_name: str,
 ) -> None:
@@ -702,16 +771,55 @@ def validate_video_evidence_items(
                 f"{field_name}[{index}] clip_id mismatch for {selection_id}: "
                 f"expected {expected['clip_id']}, got {item.get('clip_id')}"
             )
-        if str(item.get("time_range", "")) != expected["time_range"]:
+        evidence_time_range = str(item.get("time_range", ""))
+        try:
+            evidence_start, evidence_end = parse_time_range(evidence_time_range)
+        except RuntimeError as exc:
+            raise RuntimeError(f"{field_name}[{index}] {exc}") from exc
+        if evidence_start < expected["range_start"] or evidence_end > expected["range_end"]:
             raise RuntimeError(
-                f"{field_name}[{index}] time_range mismatch for {selection_id}: "
-                f"expected {expected['time_range']}, got {item.get('time_range')}"
+                f"{field_name}[{index}] time_range must stay within clip window for {selection_id}: "
+                f"clip={expected['time_range']}, got {evidence_time_range}"
+            )
+        if abs(evidence_start - expected["range_start"]) < 0.001 and abs(evidence_end - expected["range_end"]) < 0.001:
+            raise RuntimeError(
+                f"{field_name}[{index}] time_range must be a specific subrange, not the full clip window for "
+                f"{selection_id}: {evidence_time_range}"
             )
         if not str(item.get("observation", "")).strip():
             raise RuntimeError(f"{field_name}[{index}] observation must not be empty")
 
 
-def ensure_analysis_evidence(payload: dict[str, Any], selected_clips: list[dict[str, Any]]) -> None:
+def iter_context_evidence(payload: dict[str, Any]) -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    goal = payload["goal_assessment"]
+    for value in goal["context_evidence"]:
+        items.append(("goal_assessment.context_evidence", str(value)))
+    state = payload["state_assessment"]
+    for value in state["context_evidence"]:
+        items.append(("state_assessment.context_evidence", str(value)))
+    for group_name in ("strengths", "weaknesses"):
+        for idx, item in enumerate(state[group_name], start=1):
+            for value in item["context_evidence"]:
+                items.append((f"state_assessment.{group_name}[{idx}].context_evidence", str(value)))
+    for group_name in ("top_findings", "priority_actions", "keep_doing", "next_session_focus"):
+        for idx, item in enumerate(payload[group_name], start=1):
+            for value in item["context_evidence"]:
+                items.append((f"{group_name}[{idx}].context_evidence", str(value)))
+    return items
+
+
+def validate_minimal_context_evidence(payload: dict[str, Any]) -> None:
+    for field_name, value in iter_context_evidence(payload):
+        for marker in MINIMAL_CONTEXT_BANNED_MARKERS:
+            if marker in value:
+                raise RuntimeError(f"{field_name} references disallowed non-video context in minimal_profile mode: {value}")
+
+
+def ensure_analysis_evidence(payload: dict[str, Any], selected_clips: list[dict[str, Any]], *, context_mode: str) -> None:
+    if context_mode == "minimal_profile":
+        validate_minimal_context_evidence(payload)
+
     selected = selection_index(selected_clips)
     validate_video_evidence_items(payload["session_summary_evidence"], selected, field_name="session_summary_evidence")
 
@@ -785,6 +893,11 @@ def render_markdown(result: dict[str, Any], *, model_name: str) -> str:
     lines.append("# 网球训练分析报告")
     lines.append("")
     lines.append(f"- 模型：`{model_name}`")
+    trace = result.get("trace") or {}
+    if trace.get("context_mode"):
+        lines.append(f"- 上下文模式：`{trace['context_mode']}`")
+    if trace.get("evidence_time_mode"):
+        lines.append(f"- 证据时间：`{trace['evidence_time_mode']}`")
     lines.append("")
     lines.append("## Session Summary")
     lines.append(result["session_summary"])
@@ -876,11 +989,6 @@ def derive_output_dir(selection_package_path: pathlib.Path) -> pathlib.Path:
 def main() -> None:
     args = parse_args()
     config = load_toml(pathlib.Path(args.config).expanduser())
-    memory_root_value = nested_get(config, "memory", "obsidian_vault_dir", default="")
-    if not memory_root_value:
-        raise SystemExit("config.toml is missing memory.obsidian_vault_dir")
-    memory_root = pathlib.Path(str(memory_root_value)).expanduser()
-
     selection_package_path = pathlib.Path(args.selection_package).expanduser().resolve()
     selection_package = load_selection_package(selection_package_path)
 
@@ -895,14 +1003,25 @@ def main() -> None:
     api_key_value = str(openrouter_cfg.get("api_key", "")).strip()
     api_key_env_var = str(openrouter_cfg.get("api_key_env_var", DEFAULTS["api_key_env_var"]))
     max_memory_chars = int(analysis_cfg.get("max_memory_chars", DEFAULTS["max_memory_chars"]))
+    context_mode = str(analysis_cfg.get("context_mode", DEFAULTS["context_mode"])).strip() or DEFAULTS["context_mode"]
+    if context_mode not in CONTEXT_MODES:
+        raise SystemExit(f"Invalid analysis.context_mode: {context_mode}. Expected one of: {', '.join(sorted(CONTEXT_MODES))}")
 
     api_key = api_key_value or os.environ.get(api_key_env_var, "")
     if not api_key:
         raise SystemExit(f"Missing API key: set analysis.openrouter.api_key or environment variable {api_key_env_var}")
 
     selected_clips = selection_package["selected_clips"]
-    memory_docs = load_memory_documents(memory_root, max_memory_chars=max_memory_chars)
-    user_text = build_user_text(selected_clips, memory_docs)
+    system_prompt = load_prompt_text(DEFAULTS["system_prompt_path"])
+    user_scaffold = load_prompt_text(DEFAULTS["user_scaffold_path"])
+    memory_docs: list[dict[str, str]] = []
+    if context_mode == "full_memory":
+        memory_root_value = nested_get(config, "memory", "obsidian_vault_dir", default="")
+        if not memory_root_value:
+            raise SystemExit("config.toml is missing memory.obsidian_vault_dir")
+        memory_root = pathlib.Path(str(memory_root_value)).expanduser()
+        memory_docs = load_memory_documents(memory_root, max_memory_chars=max_memory_chars)
+    user_text = build_user_text(selected_clips, memory_docs, scaffold=user_scaffold, context_mode=context_mode)
     user_content = build_user_content(
         selected_clips,
         frames_per_clip=frames_per_clip,
@@ -915,27 +1034,30 @@ def main() -> None:
         primary_model=primary_model,
         fallback_model=fallback_model,
         timeout_seconds=timeout_seconds,
+        system_prompt=system_prompt,
         user_content=user_content,
     )
     result = parse_gemini_response(raw_response) if is_gemini_api_base(api_base) else parse_openrouter_response(raw_response)
     ensure_analysis_shape(result)
-    ensure_analysis_evidence(result, selected_clips)
+    ensure_analysis_evidence(result, selected_clips, context_mode=context_mode)
 
-    output_dir = derive_output_dir(selection_package_path)
-    output_dir.mkdir(parents=True, exist_ok=True)
     result_with_trace = {
         **result,
         "trace": {
             "provider": provider_name,
             "model": used_model,
+            "context_mode": context_mode,
+            "evidence_time_mode": "absolute_subrange",
         },
     }
+    output_dir = derive_output_dir(selection_package_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "analysis-result.json").write_text(
         json.dumps(result_with_trace, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     (output_dir / "analysis-report.md").write_text(
-        render_markdown(result, model_name=used_model),
+        render_markdown(result_with_trace, model_name=used_model),
         encoding="utf-8",
     )
     print(str(output_dir / "analysis-result.json"))

@@ -50,7 +50,11 @@ temperature = 0
 # Number of evenly sampled frames extracted from each selected clip.
 frames_per_clip = 6
 
-# Upper bound for concatenated memory markdown content sent into the model.
+# Context mode for analysis prompt construction: `minimal_profile` or `full_memory`.
+context_mode = "minimal_profile"
+
+# Upper bound for concatenated memory markdown content sent into the model when
+# context_mode is `full_memory`.
 max_memory_chars = 32000
 
 [analysis.openrouter]

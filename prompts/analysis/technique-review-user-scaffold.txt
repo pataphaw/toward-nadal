@@ -1,0 +1,29 @@
+任务：请基于以下训练片段，输出当天网球技术复盘。
+必须覆盖：
+1. 从视频中能观察或谨慎推断出的当前网球技术状态、训练内容和当天达成度。
+2. 当天状态的整体判断，包括发挥好的技术特点和差的技术特点。
+3. 当天的主要问题，以及后续改进方案。
+4. 当天发挥好的方面，以及后续如何继续保持。
+5. 每一条结论都必须绑定到具体视频片段。
+
+依据边界：
+1. 除最小个人信息外，所有技术判断必须以视频关键帧中可观察到的内容为依据。
+2. 最小个人信息只用于理解身体条件和水平背景，不能单独支撑技术结论。
+3. 不要使用未提供的历史画像、训练记录、长期问题或过往比赛结论。
+4. 如果当前模式为 minimal_profile，context_evidence 只能为空，或引用最小个人信息。
+
+视频证据输出强约束：
+1. 任何分析观点都必须至少带一条 video_evidence。
+2. video_evidence.selection_id / clip_id 必须原样抄写自下方片段 reference。
+3. video_evidence.time_range 必须写成原始目标视频中的绝对时间子区间，并且必须落在对应 reference 的 time_range 内。
+4. video_evidence.time_range 禁止等于整段 reference.time_range，必须定位到更具体的动作时段。
+5. observation 必须描述该片段里实际看到的动作、站位、击球或结果，不能写抽象总结。
+6. 如果没有具体片段证据，就不要输出该观点。
+
+当前 analysis.context_mode = {{context_mode}}
+
+分析上下文如下：
+{{analysis_context_block}}
+
+视频片段元数据如下：
+{{selected_clips_block}}

@@ -83,6 +83,8 @@ DEFAULTS = {
     "bright_threshold": 226.0,
     "opencv_diff_percentile": 92.0,
     "opencv_min_component_area_ratio": 0.0025,
+    "selection_prompt_path": "prompts/selection/model-judgement-user.txt",
+    "selection_scaffold_path": "prompts/selection/model-judgement-user-scaffold.txt",
 }
 
 MODEL_JUDGEMENT_SCHEMA = {
@@ -120,43 +122,6 @@ MODEL_JUDGEMENT_SCHEMA = {
     "additionalProperties": False,
 }
 
-MODEL_PROMPT_TEMPLATE = """你是网球训练视频片段筛选器。你只判断当前候选片段是否适合进入后续技术分析，不输出训练建议。
-
-输入包括按时间顺序排列的关键帧，以及候选元数据和 CV 证据摘要。
-
-请只基于这些关键帧判断：
-1. 这段是否真正在打网球。
-2. 是否只是休息、捡球、等待、走动或镜头噪声。
-3. rally 是否基本完整。
-4. 是否能看到明显正手、反手或发球。
-5. 是否具备复盘价值：亮点、好例子或问题样本。
-
-如果证据不足，必须输出 uncertain。不要因为动作不好就排除问题样本。不要输出最终技术诊断。
-
-必须只输出一个 JSON object，且字段必须完整，不能省略，不能添加额外字段。
-
-输出格式固定如下：
-{
-  "schema_version": "model_judgement.v1",
-  "candidate_id": "<输入里的 candidate_id>",
-  "in_play": "yes|no|uncertain",
-  "non_play_type": "none|picking_ball|resting|walking|waiting|camera_noise|uncertain",
-  "rally_completeness": "complete|partial_start_missing|partial_end_missing|multi_rally|uncertain",
-  "action_tags": ["forehand|backhand|serve"],
-  "context_tags": ["baseline|midcourt|running|stationary"],
-  "value_tags": ["highlight|good_example|problem_example"],
-  "reject_reasons": ["..."],
-  "selection_reason": "...",
-  "confidence": 0.0
-}
-
-规则补充：
-- 如果 in_play = "yes"，non_play_type 应为 "none" 或 "uncertain"。
-- 如果 in_play = "no"，value_tags 必须为空数组。
-- confidence 必须是 0 到 1 之间的数字。
-- 如果没有明显证据，不要猜，使用 uncertain。"""
-
-
 def run_command(args: Sequence[str], *, capture_stdout: bool = False) -> str:
     result = subprocess.run(
         list(args),
@@ -168,6 +133,24 @@ def run_command(args: Sequence[str], *, capture_stdout: bool = False) -> str:
     if result.returncode != 0:
         raise RuntimeError(f"command failed: {' '.join(args)}\n{result.stderr[-1200:]}")
     return result.stdout if capture_stdout else result.stderr
+
+
+def repo_root() -> pathlib.Path:
+    return pathlib.Path(__file__).resolve().parent.parent
+
+
+def load_prompt_text(relative_path: str) -> str:
+    path = repo_root() / relative_path
+    if not path.exists():
+        raise SystemExit(f"Missing prompt file: {path}")
+    return path.read_text(encoding="utf-8")
+
+
+def render_prompt_scaffold(scaffold: str, replacements: dict[str, str]) -> str:
+    rendered = scaffold
+    for key, value in replacements.items():
+        rendered = rendered.replace(f"{{{{{key}}}}}", value)
+    return rendered
 
 
 def ffprobe_json(video_path: pathlib.Path) -> dict[str, Any]:
@@ -1951,6 +1934,8 @@ def build_model_input_packages(
     *,
     frames_per_candidate: int,
 ) -> list[dict[str, Any]]:
+    task_prompt = load_prompt_text(DEFAULTS["selection_prompt_path"])
+    prompt_scaffold = load_prompt_text(DEFAULTS["selection_scaffold_path"])
     model_inputs_dir = output_dir / "model_inputs"
     model_inputs_dir.mkdir(parents=True, exist_ok=True)
     packages: list[dict[str, Any]] = []
@@ -1969,7 +1954,6 @@ def build_model_input_packages(
             output_path=candidate_video_path,
         )
         frame_paths = extract_candidate_frames(candidate_video_path, frames_dir, max(1, min(12, frames_per_candidate)))
-        prompt_path.write_text(MODEL_PROMPT_TEMPLATE, encoding="utf-8")
 
         input_payload = {
             "schema_version": "model_judgement.v1",
@@ -1983,6 +1967,17 @@ def build_model_input_packages(
         input_hash = hashlib.sha1(json.dumps(input_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
         input_payload["input_hash"] = input_hash
         input_json_path.write_text(json.dumps(input_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        prompt_text = render_prompt_scaffold(
+            prompt_scaffold,
+            {
+                "task_prompt": task_prompt,
+                "candidate_payload_json": json.dumps(
+                    {key: value for key, value in input_payload.items() if key not in {"frame_paths", "input_hash"}},
+                    ensure_ascii=False,
+                ),
+            },
+        )
+        prompt_path.write_text(prompt_text, encoding="utf-8")
 
         package = {
             "candidate_id": candidate_id,
@@ -2061,22 +2056,12 @@ def call_ollama_chat(
     temperature: float,
 ) -> tuple[str, str]:
     images_base64 = [base64.b64encode(pathlib.Path(path).read_bytes()).decode("ascii") for path in image_paths]
-    prompt_payload = {
-        key: value
-        for key, value in candidate_payload.items()
-        if key not in {"frame_paths", "input_hash"}
-    }
-    user_prompt = (
-        f"{prompt}\n\n候选元数据与 CV 证据：\n"
-        f"{json.dumps(prompt_payload, ensure_ascii=False)}\n\n"
-        "请返回严格 JSON。"
-    )
     payload = {
         "model": model,
         "stream": False,
         "format": "json",
         "options": {"temperature": float(temperature), "num_predict": 220},
-        "messages": [{"role": "user", "content": user_prompt, "images": images_base64}],
+        "messages": [{"role": "user", "content": prompt, "images": images_base64}],
     }
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(endpoint, data=body, method="POST")
